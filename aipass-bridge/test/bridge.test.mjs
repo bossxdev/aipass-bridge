@@ -94,6 +94,36 @@ test('forwards only the newest user message, never an assistant turn', async () 
   await ext.disconnect();
 });
 
+test('strips injected <instructions> blocks before forwarding to the extension', async () => {
+  const handler = scripted(['ok']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+
+  await post({
+    messages: [
+      { role: 'user', content: '<instructions>\nsome hook output\n</instructions>\n\nactual user question' },
+    ],
+  });
+
+  assert.equal(handler.sent.at(-1), 'actual user question');
+  assert.doesNotMatch(handler.sent.at(-1), /<instructions>/);
+  await ext.disconnect();
+});
+
+test('strips instructions block from multi-part content array', async () => {
+  const handler = scripted(['ok']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+
+  await post({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '<instructions>\nhook\n</instructions>\n\nreal question' }] },
+    ],
+  });
+
+  assert.equal(handler.sent.at(-1), 'real question');
+  assert.doesNotMatch(handler.sent.at(-1), /<instructions>/);
+  await ext.disconnect();
+});
+
 test('non-streaming returns a complete message with usage', async () => {
   const ext = await new FakeExtension(bridge.base, {
     onChat: async (_j, e) => { await e.text('the answer'); await e.done(); },

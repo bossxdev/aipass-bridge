@@ -305,14 +305,25 @@ function startChat({ modelId, text, onDelta, onDone, onError }) {
   return { abort: () => current?.abort() };
 }
 
+// Strip hook-injected <instructions>...</instructions> blocks that Claude Code
+// prepends to user messages via UserPromptSubmit hooks. The actual user text
+// follows the closing tag (or is in a separate content part after it).
+function stripInjectedInstructions(text) {
+  // Remove every <instructions>...</instructions> block (potentially multi-line).
+  return text.replace(/<instructions>[\s\S]*?<\/instructions>/g, '').trim();
+}
+
 // Only the newest user message is sent. The server holds the history, and a
 // messages array containing an assistant turn is rejected upstream.
 function lastUserText(messages) {
   const texts = (messages ?? [])
     .filter((m) => m.role === 'user')
-    .map((m) => (typeof m.content === 'string'
-      ? m.content
-      : (m.content ?? []).map((p) => (p?.type === 'text' ? p.text : '')).join('')));
+    .map((m) => {
+      const raw = typeof m.content === 'string'
+        ? m.content
+        : (m.content ?? []).map((p) => (p?.type === 'text' ? p.text : '')).join('');
+      return stripInjectedInstructions(raw);
+    });
   return texts.at(-1)?.trim() ?? '';
 }
 
