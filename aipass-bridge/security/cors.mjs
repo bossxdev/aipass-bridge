@@ -60,7 +60,7 @@ export function preflightHeaders(origin) {
  * Write a 403 origin_forbidden response and return true (caller should return).
  * Shared helper so the main request handler stays readable.
  */
-export function rejectOrigin(res, origin) {
+export function rejectOrigin(res, _origin) {
   const body = JSON.stringify(errorBody(E.origin_forbidden, 'origin not allowed', 'authentication_error'));
   // Do NOT reflect origin back in the error; just close with no ACAO.
   res.writeHead(403, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });

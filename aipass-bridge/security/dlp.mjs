@@ -110,7 +110,7 @@ export function redact(text) {
       re.lastIndex = 0;
       out = replacer
         ? out.replace(re, (...args) => { const r = replacer(...args); if (r !== args[0]) { counts[name] = (counts[name] ?? 0) + 1; } return r; })
-        : out.replace(re, (m) => { counts[name] = (counts[name] ?? 0) + 1; return REDACTED; });
+        : out.replace(re, (_m) => { counts[name] = (counts[name] ?? 0) + 1; return REDACTED; });
       re.lastIndex = 0;
     }
     return { text: out, counts };
