@@ -1,0 +1,23 @@
+services:
+  aipass-bridge:
+    build: .
+    image: aipass-bridge:latest
+    container_name: aipass-bridge
+    restart: unless-stopped
+    # Pass your token as an env var; otherwise the container generates one
+    # inside its own (ephemeral) home dir — mount a volume to keep it stable.
+    environment:
+      - AIPASS_TOKEN=${AIPASS_TOKEN:-}
+      # - AIPASS_MODEL=gemini-3.1-flash-lite
+      # - AIPASS_CONVERSATION_ID=
+      # - AIPASS_ALLOWED_ORIGINS=
+    ports:
+      # Host port configurable: 8787 is taken by another local tool on this
+      # machine, so run with AIPASS_DOCKER_PORT=8788 (what the extension and
+      # 9Router already point at).
+      - "${AIPASS_DOCKER_PORT:-8787}:8787"
+    volumes:
+      - bridge-token:/home/bridge/.aipass-bridge
+
+volumes:
+  bridge-token:
