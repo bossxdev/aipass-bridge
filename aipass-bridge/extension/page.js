@@ -197,6 +197,7 @@
       const fn = msg.job.kind === 'loader' ? runLoader : msg.job.kind === 'create' ? runCreate : run;
       fn(msg.job);
     }
+    else if (msg[TAG] === 'ping') reply({ kind: 'page-ready' });
     else if (msg[TAG] === 'abort') inflight.get(msg.jobId)?.abort();
   });
 

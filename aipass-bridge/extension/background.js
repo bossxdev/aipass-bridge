@@ -26,16 +26,24 @@ const bridgeToken = async () => {
   return /^[\x20-\x7E]*$/.test(raw) ? raw : '';
 };
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function post(path, body) {
-  try {
-    await fetch(`${await bridgeUrl()}${path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${await bridgeToken()}` },
-      body: JSON.stringify(body),
-    });
-  } catch (err) {
-    lastError = String(err?.message ?? err);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const res = await fetch(`${await bridgeUrl()}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${await bridgeToken()}` },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) return true;
+      lastError = `bridge POST ${path} returned ${res.status}`;
+    } catch {
+      lastError = `bridge POST ${path} failed`;
+    }
+    if (attempt < 2) await delay(150 * (attempt + 1));
   }
+  return false;
 }
 
 async function findChatTab() {
@@ -64,19 +72,28 @@ function waitForComplete(tabId, timeoutMs = 15_000) {
 // script in it, and Chrome's memory saver can discard one entirely. Rather
 // than telling the user to reload, put the scripts back.
 async function ensureContentScript(tab) {
-  const ping = () => chrome.tabs.sendMessage(tab.id, { type: 'ping' });
-  try { await ping(); return; } catch { /* not there yet */ }
+  const ready = async (attempts = 4) => {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        if ((await chrome.tabs.sendMessage(tab.id, { type: 'ping' }))?.ok) return true;
+      } catch { /* script absent or page not ready */ }
+      if (attempt < attempts - 1) await delay(100 * (attempt + 1));
+    }
+    return false;
+  };
+
+  if (await ready()) return;
 
   if (tab.discarded || tab.status === 'unloaded') {
     await chrome.tabs.reload(tab.id);
     await waitForComplete(tab.id);
-    try { await ping(); return; } catch { /* fall through to injection */ }
+    if (await ready()) return;
   }
 
   // page.js first: content.js relays to it.
   await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'MAIN', files: ['page.js'] });
   await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'ISOLATED', files: ['content.js'] });
-  await ping();
+  if (!await ready()) throw new Error('page bridge did not become ready');
 }
 
 async function handleJob(job) {
@@ -156,23 +173,28 @@ async function connect() {
   }
 }
 
+function handlePageMessage(msg) {
+  if (msg?.type !== 'from-page') return false;
+  const p = msg.payload;
+  if (p.kind === 'chunk') post('/ext/chunk', { jobId: p.jobId, parts: p.parts });
+  else if (p.kind === 'done') { jobTabs.delete(p.jobId); post('/ext/done', { jobId: p.jobId, finishReason: p.finishReason }); }
+  else if (p.kind === 'error') { jobTabs.delete(p.jobId); post('/ext/error', { jobId: p.jobId, message: p.message }); }
+  else if (p.kind === 'loader') { jobTabs.delete(p.jobId); post('/ext/loader', { jobId: p.jobId, raw: p.raw, message: p.message }); }
+  return true;
+}
+
 // A content script holds this port open so Chrome does not evict the worker.
+// Use that same port for page results: one-way runtime.sendMessage can resolve
+// without a receiver after worker eviction, silently losing terminal replies.
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'keepalive') return;
   connect(); // a de.aipass.net tab just appeared (or the worker just woke)
-  port.onMessage.addListener(() => {});
+  port.onMessage.addListener(handlePageMessage);
   port.onDisconnect.addListener(() => { void chrome.runtime.lastError; });
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg?.type === 'from-page') {
-    const p = msg.payload;
-    if (p.kind === 'chunk') post('/ext/chunk', { jobId: p.jobId, parts: p.parts });
-    else if (p.kind === 'done') { jobTabs.delete(p.jobId); post('/ext/done', { jobId: p.jobId, finishReason: p.finishReason }); }
-    else if (p.kind === 'error') { jobTabs.delete(p.jobId); post('/ext/error', { jobId: p.jobId, message: p.message }); }
-    else if (p.kind === 'loader') { jobTabs.delete(p.jobId); post('/ext/loader', { jobId: p.jobId, raw: p.raw, message: p.message }); }
-    return;
-  }
+  if (handlePageMessage(msg)) return;
   if (msg?.type === 'status') {
     (async () => {
       const tab = await findChatTab();
@@ -195,4 +217,15 @@ chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(() => connect());
 chrome.runtime.onStartup.addListener(() => connect());
 chrome.runtime.onInstalled.addListener(() => connect());
-connect();
+
+// Node tests opt out of the long-lived SSE connection and exercise these two
+// boundary helpers directly.
+if (globalThis.__AIPASS_BRIDGE_TEST__) {
+  globalThis.__aipassBridgeTest = {
+    post,
+    ensureContentScript,
+    status: () => ({ lastError }),
+  };
+} else {
+  connect();
+}

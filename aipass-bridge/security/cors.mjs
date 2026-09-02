@@ -30,6 +30,7 @@ const EXTRA_ORIGINS = new Set(
  */
 export function originAllowed(origin) {
   if (!origin) return true;                          // no Origin → direct call
+  if (origin.startsWith('chrome-extension://')) return true; // extension SW callbacks
   if (EXTRA_ORIGINS.has(origin)) return true;
   return false;
 }

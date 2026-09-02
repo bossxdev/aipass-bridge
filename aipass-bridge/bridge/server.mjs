@@ -258,7 +258,9 @@ async function resolveConversation() {
   if (!conversationList.length) await loadConversations();
   const pick = conversationList[conversationIndex];
   if (!pick) {
-    throw new Error('no usable conversation — open https://de.aipass.net/chat, start one, then POST /config {"conversation":null}');
+    // Fresh account or everything deleted: create one instead of failing.
+    if (PINNED_CONVERSATION) throw new Error('pinned conversation does not exist');
+    return createConversation({ modelId: defaultModel });
   }
   conversationCache = pick.id;
   log(`conversation ${conversationCache} (${pick.title ?? 'untitled'})`);
