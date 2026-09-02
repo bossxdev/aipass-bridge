@@ -69,10 +69,15 @@ $('model').addEventListener('change', async () => {
 });
 
 $('save').addEventListener('click', async () => {
+  const tokenVal = $('token').value.trim();
+  if (tokenVal && !/^[\x20-\x7E]*$/.test(tokenVal)) {
+    $('err').textContent = 'Bearer token must contain only printable ASCII characters.';
+    return;
+  }
   savedAt = Date.now();
   await chrome.storage.local.set({
     bridgeUrl: $('url').value.trim().replace(/\/+$/, ''),
-    token: $('token').value.trim(),
+    token: tokenVal,
   });
   await chrome.runtime.sendMessage({ type: 'reconnect' });
   setTimeout(() => refresh(true), 400);

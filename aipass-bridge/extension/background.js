@@ -18,7 +18,13 @@ const bridgeUrl = async () =>
   ((await chrome.storage.local.get('bridgeUrl')).bridgeUrl || DEFAULT_BRIDGE).trim();
 
 // Bearer token set in the popup; every bridge call carries it.
-const bridgeToken = async () => ((await chrome.storage.local.get('token')).token || '').trim();
+// HTTP header values must be ISO-8859-1 (printable ASCII for bearer tokens).
+// If the stored value contains characters outside that range, discard it so
+// fetch() does not throw a "non ISO-8859-1 code point" error.
+const bridgeToken = async () => {
+  const raw = ((await chrome.storage.local.get('token')).token || '').trim();
+  return /^[\x20-\x7E]*$/.test(raw) ? raw : '';
+};
 
 async function post(path, body) {
   try {
