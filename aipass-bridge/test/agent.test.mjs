@@ -223,12 +223,14 @@ test('--reuse continues the most recent conversation instead', async (t) => {
   t.after(() => ext.disconnect());
 
   await fetch(`${bridge.base}/config`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ conversation: null }),
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${bridge.token}` },
+    body: JSON.stringify({ conversation: null }),
   });
   const { out } = await agent(dir, ['--reuse']);
   assert.equal(ext.created.length, 0, 'nothing should be created');
   assert.equal(ext.chats.at(-1).conversationId, 'aaaa1111aaaa1111');
   assert.match(out, /reusing the most recent/);
+  assert.match(out, /sensitive data may persist upstream/, '--reuse must warn about history retention');
 });
 
 test('--conversation pins an explicit one', async (t) => {

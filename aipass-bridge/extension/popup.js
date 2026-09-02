@@ -1,13 +1,15 @@
 const $ = (id) => document.getElementById(id);
 let bridge = 'http://127.0.0.1:8787';
+let token = '';
 let lastModelSignature = '';
+const auth = () => ({ authorization: `Bearer ${token}` });
 
 async function bridgeStatus(refresh = false) {
   try {
-    const res = await fetch(`${bridge}/status`, { cache: 'no-store' });
+    const res = await fetch(`${bridge}/status`, { cache: 'no-store', headers: auth() });
     if (!res.ok) return null;
     const s = await res.json();
-    if (refresh) await fetch(`${bridge}/v1/models?refresh=1`, { cache: 'no-store' });
+    if (refresh) await fetch(`${bridge}/v1/models?refresh=1`, { cache: 'no-store', headers: auth() });
     return s;
   } catch {
     return null;
@@ -43,6 +45,8 @@ function renderModels(models, selected) {
 async function refresh(forceModels = false) {
   const sw = await chrome.runtime.sendMessage({ type: 'status' });
   bridge = sw.bridgeUrl;
+  token = (await chrome.storage.local.get('token')).token || '';
+  if (document.activeElement !== $('token')) $('token').value = token;
   $('conn').innerHTML =
     `<span class="dot ${sw.connected ? 'up' : 'down'}"></span>${sw.connected ? 'connected' : 'not connected'}`;
   $('tab').textContent = sw.tab ? new URL(sw.tab.url).pathname : 'none open';
@@ -58,13 +62,16 @@ async function refresh(forceModels = false) {
 $('model').addEventListener('change', async () => {
   await fetch(`${bridge}/config`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...auth() },
     body: JSON.stringify({ defaultModel: $('model').value }),
   }).catch(() => {});
 });
 
 $('save').addEventListener('click', async () => {
-  await chrome.storage.local.set({ bridgeUrl: $('url').value.trim().replace(/\/+$/, '') });
+  await chrome.storage.local.set({
+    bridgeUrl: $('url').value.trim().replace(/\/+$/, ''),
+    token: $('token').value.trim(),
+  });
   await chrome.runtime.sendMessage({ type: 'reconnect' });
   setTimeout(() => refresh(true), 400);
 });

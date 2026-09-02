@@ -10,6 +10,9 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { E, errorBody } from '../security/errors.mjs';
+import { redact } from '../security/dlp.mjs';
+import { checkAuth, loadToken, tokenFilePath } from '../security/auth.mjs';
+import { originAllowed, corsHeaders, preflightHeaders, rejectOrigin } from '../security/cors.mjs';
 
 const PORT = Number(process.env.AIPASS_PORT ?? 8787);
 const HOST = process.env.AIPASS_HOST ?? '127.0.0.1';
@@ -332,7 +335,7 @@ function json(res, status, obj) {
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(body),
-    'access-control-allow-origin': '*',
+    ...corsHeaders(res.req?.headers.origin),
   });
   res.end(body);
 }
@@ -348,8 +351,14 @@ async function chatCompletions(req, res) {
   catch { return oaiError(res, 400, 'invalid JSON body', 'invalid_request_error', E.server_error); }
 
   const model = String(payload.model ?? defaultModel).replace(/^aipass\//, '');
-  const text = lastUserText(payload.messages);
-  if (!text) return oaiError(res, 400, 'no user message', 'invalid_request_error', E.server_error);
+  const raw = lastUserText(payload.messages);
+  if (!raw) return oaiError(res, 400, 'no user message', 'invalid_request_error', E.server_error);
+
+  // Authoritative DLP boundary: strip secrets/PII before the text becomes a
+  // Job the extension relays upstream. Counts only are logged, never values.
+  const { text, counts } = redact(raw);
+  const tally = Object.entries(counts);
+  if (tally.length) log(`dlp -> ${tally.map(([k, n]) => `${k}:${n}`).join(' ')}`);
 
   const id = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -361,7 +370,7 @@ async function chatCompletions(req, res) {
       'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
-      'access-control-allow-origin': '*',
+      ...corsHeaders(req.headers.origin),
     });
     const emit = (delta, finish = null) => {
       res.write(`data: ${JSON.stringify({
@@ -439,7 +448,7 @@ function extEvents(req, res) {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
-    'access-control-allow-origin': '*',
+    ...corsHeaders(req.headers.origin),
     'access-control-allow-private-network': 'true',
   });
   const client = { id: randomUUID(), res };
@@ -482,14 +491,27 @@ const server = http.createServer(async (req, res) => {
   const path = url.pathname.replace(/\/+$/, '') || '/';
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'access-control-allow-origin': '*',
-      'access-control-allow-methods': 'GET,POST,OPTIONS',
-      'access-control-allow-headers': '*',
-      'access-control-allow-private-network': 'true',
-      'access-control-max-age': '86400',
-    });
+    const origin = req.headers.origin;
+    if (!originAllowed(origin)) return rejectOrigin(res, origin);
+    res.writeHead(204, preflightHeaders(origin));
     return res.end();
+  }
+
+  // Reject unrecognised web origins before auth runs.
+  const origin = req.headers.origin;
+  if (!originAllowed(origin)) return rejectOrigin(res, origin);
+
+  // Minimal health probe is the sole unauthenticated route.
+  if (path === '/health') return json(res, 200, { ok: true });
+
+  // Every other route requires a valid Bearer token.
+  const authResult = checkAuth(req);
+  if (authResult !== true) {
+    return json(res, 401, errorBody(
+      authResult === 'missing' ? E.auth_required : E.auth_invalid,
+      authResult === 'missing' ? 'authorization header required' : 'invalid bearer token',
+      'authentication_error',
+    ));
   }
 
   try {
@@ -541,7 +563,7 @@ const server = http.createServer(async (req, res) => {
     if (path === '/ext/error' && req.method === 'POST') return await extPost(req, res, 'error');
     if (path === '/ext/loader' && req.method === 'POST') return await extPost(req, res, 'loader');
 
-    if (path === '/status' || path === '/health') {
+    if (path === '/status') {
       return json(res, 200, {
         ok: true,
         extensions: extClients.size,
@@ -562,8 +584,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
+  loadToken();
   log(`aipass bridge on http://${HOST}:${PORT}`);
   log(`  default model : ${defaultModel}`);
   log(`  conversation  : ${PINNED_CONVERSATION || 'most recent on the account'}`);
+  if (!process.env.AIPASS_TOKEN) log(`  auth token    : ${tokenFilePath()} (all routes except /health)`);
+  else log('  auth token    : AIPASS_TOKEN env');
   log('  waiting for the Chrome extension…');
 });

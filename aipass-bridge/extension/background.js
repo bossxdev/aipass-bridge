@@ -17,11 +17,14 @@ const jobTabs = new Map();
 const bridgeUrl = async () =>
   (await chrome.storage.local.get('bridgeUrl')).bridgeUrl || DEFAULT_BRIDGE;
 
+// Bearer token set in the popup; every bridge call carries it.
+const bridgeToken = async () => (await chrome.storage.local.get('token')).token || '';
+
 async function post(path, body) {
   try {
     await fetch(`${await bridgeUrl()}${path}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${await bridgeToken()}` },
       body: JSON.stringify(body),
     });
   } catch (err) {
@@ -106,7 +109,7 @@ async function connect() {
 
   try {
     const res = await fetch(`${await bridgeUrl()}/ext/events`, {
-      headers: { accept: 'text/event-stream' },
+      headers: { accept: 'text/event-stream', authorization: `Bearer ${await bridgeToken()}` },
       signal,
     });
     if (!res.ok || !res.body) throw new Error(`bridge responded ${res.status}`);

@@ -33,18 +33,23 @@ export async function waitFor(check, { timeout = 5000, every = 25 } = {}) {
 
 export async function startBridge(env = {}) {
   const port = await freePort();
+  // Fresh token per bridge instance so tests never share credentials.
+  const token = 'test-token-' + Math.random().toString(36).slice(2);
+  // Child CLIs spawned by tests inherit this token.
+  process.env.AIPASS_TOKEN = token;
   const child = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, AIPASS_PORT: String(port), ...env },
+    env: { ...process.env, AIPASS_PORT: String(port), AIPASS_TOKEN: token, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const log = [];
   child.stdout.on('data', (d) => log.push(String(d)));
   child.stderr.on('data', (d) => log.push(String(d)));
   const base = `http://127.0.0.1:${port}`;
-  await waitFor(() => fetch(`${base}/status`).then((r) => r.ok).catch(() => false));
+  await waitFor(() => fetch(`${base}/health`).then((r) => r.ok).catch(() => false));
   return {
     base,
     port,
+    token,
     log,
     logText: () => log.join(''),
     stop() { child.kill('SIGKILL'); },
@@ -110,34 +115,42 @@ const DEFAULT_CONVERSATIONS = [
 // Stands in for the extension. `onChat` receives the job plus an emitter and
 // decides what the upstream would have streamed back.
 export class FakeExtension {
-  constructor(base, { onChat, models = DEFAULT_MODELS, conversations = DEFAULT_CONVERSATIONS } = {}) {
+  constructor(base, { onChat, models = DEFAULT_MODELS, conversations = DEFAULT_CONVERSATIONS, token } = {}) {
     this.base = base;
+    this.token = token ?? process.env.AIPASS_TOKEN ?? '';
     this.onChat = onChat ?? (async (_job, e) => { await e.text('ok'); await e.done(); });
     this.models = models;
     this.conversations = conversations;
-    this.chats = [];       // every chat job received
-    this.created = [];     // every create-conversation job received
-    this.loaders = [];     // every loader url received
+    this.chats = [];
+    this.created = [];
+    this.loaders = [];
+  }
+
+  #authHeader() {
+    return this.token ? { authorization: `Bearer ${this.token}` } : {};
   }
 
   post(p, body) {
     return fetch(`${this.base}${p}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...this.#authHeader() },
+      body: JSON.stringify(body),
     }).catch(() => {});
   }
 
   async count() {
-    const r = await fetch(`${this.base}/status`).then((x) => x.json()).catch(() => null);
+    const r = await fetch(`${this.base}/status`, { headers: this.#authHeader() })
+      .then((x) => x.json()).catch(() => null);
     return r?.extensions ?? -1;
   }
 
-  // Connect and disconnect have to be observed on the bridge, not just issued.
-  // Otherwise a test can start while a previous one's client is still
-  // registered, and round-robin hands it the wrong scripted reply.
   async connect() {
     const before = await this.count();
     this.controller = new AbortController();
-    const res = await fetch(`${this.base}/ext/events`, { signal: this.controller.signal });
+    const res = await fetch(`${this.base}/ext/events`, {
+      signal: this.controller.signal,
+      headers: this.#authHeader(),
+    });
     this.reading = this.#read(res.body.getReader());
     await waitFor(async () => (await this.count()) > before);
     return this;

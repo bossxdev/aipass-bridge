@@ -6,8 +6,12 @@ let bridge;
 before(async () => { bridge = await startBridge(); });
 after(() => bridge.stop());
 
+const auth = () => ({ authorization: `Bearer ${bridge.token}` });
+
 const post = (body) => fetch(`${bridge.base}/v1/chat/completions`, {
-  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${bridge.token}` },
+  body: JSON.stringify(body),
 });
 
 async function readStream(res) {
@@ -35,12 +39,16 @@ test('refuses a request with no extension attached', async () => {
 
 test('returns stable error codes without echoing request routes', async () => {
   const bad = await fetch(`${bridge.base}/v1/chat/completions`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{',
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${bridge.token}` },
+    body: '{',
   });
   assert.equal(bad.status, 400);
   assert.equal((await bad.json()).error.code, 'server_error');
 
-  const missing = await fetch(`${bridge.base}/path-containing-secret-value`);
+  const missing = await fetch(`${bridge.base}/path-containing-secret-value`, {
+    headers: { authorization: `Bearer ${bridge.token}` },
+  });
   assert.equal(missing.status, 404);
   const body = await missing.json();
   assert.equal(body.error.code, 'not_found');
@@ -107,9 +115,9 @@ test('rejects a request carrying no user message', async () => {
 
 test('discovers models, marks free credit, and drops media generators', async () => {
   const ext = await new FakeExtension(bridge.base).connect();
-  await waitFor(async () => (await (await fetch(`${bridge.base}/v1/models?refresh=1`)).json()).data.length > 1);
+  await waitFor(async () => (await (await fetch(`${bridge.base}/v1/models?refresh=1`, { headers: { authorization: `Bearer ${bridge.token}` } })).json()).data.length > 1);
 
-  const { data } = await (await fetch(`${bridge.base}/v1/models`)).json();
+  const { data } = await (await fetch(`${bridge.base}/v1/models`, { headers: { authorization: `Bearer ${bridge.token}` } })).json();
   const ids = data.map((m) => m.id);
   assert.ok(ids.includes('gemini-3.1-flash-lite'));
   assert.ok(ids.includes('claude-sonnet-5@default'));
@@ -130,7 +138,7 @@ test('picks the most recent conversation and rotates past one that is locked', a
   }).connect();
 
   await fetch(`${bridge.base}/config`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ conversation: null }),
+    method: 'POST', headers: { 'content-type': 'application/json', ...auth() }, body: JSON.stringify({ conversation: null }),
   });
 
   const body = await (await post({ messages: [{ role: 'user', content: 'hi' }] })).json();
@@ -169,13 +177,13 @@ test('config sets the default model and reports it', async () => {
   const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
 
   await fetch(`${bridge.base}/config`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...auth() },
     body: JSON.stringify({ defaultModel: 'claude-sonnet-5@default' }),
   });
   await post({ messages: [{ role: 'user', content: 'hi' }] });
 
   assert.equal(ext.chats.at(-1).modelId, 'claude-sonnet-5@default');
-  const status = await (await fetch(`${bridge.base}/status`)).json();
+  const status = await (await fetch(`${bridge.base}/status`, { headers: auth() })).json();
   assert.equal(status.defaultModel, 'claude-sonnet-5@default');
   await ext.disconnect();
 });
@@ -196,7 +204,7 @@ test('passes an assistant id and field through to the create call', async (t) =>
   t.after(() => ext.disconnect());
 
   const made = await (await fetch(`${bridge.base}/conversations/new`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...auth() },
     body: JSON.stringify({ message: 'hi', assistant: 'asst_xyz' }),
   })).json();
 
@@ -210,7 +218,7 @@ test('creates a conversation and adopts it', async (t) => {
   t.after(() => ext.disconnect());
 
   const made = await (await fetch(`${bridge.base}/conversations/new`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...auth() },
     body: JSON.stringify({ message: 'สวัสดี', model: 'gemini-3.1-flash-lite' }),
   })).json();
 
@@ -221,7 +229,7 @@ test('creates a conversation and adopts it', async (t) => {
   // the server derives the id from the request id it was handed
   assert.equal(made.id, ext.created[0].requestId.replace(/-/g, '').slice(0, 16));
 
-  const status = await (await fetch(`${bridge.base}/status`)).json();
+  const status = await (await fetch(`${bridge.base}/status`, { headers: auth() })).json();
   assert.equal(status.conversation, made.id, 'the new conversation becomes the current one');
 
   await post({ messages: [{ role: 'user', content: 'hi' }] });

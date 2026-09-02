@@ -13,6 +13,8 @@ const flag = (name, fallback = null) => {
   return i === -1 ? fallback : argv[i + 1];
 };
 const BRIDGE = (flag('bridge', 'http://127.0.0.1:8787')).replace(/\/+$/, '');
+const { loadToken } = await import(new URL('./security/auth.mjs', import.meta.url));
+const AUTH = { authorization: `Bearer ${loadToken()}` };
 const CONVERSATION = flag('conversation', null);
 const NEW = argv.includes('--new');
 let model = flag('model', null);
@@ -23,7 +25,7 @@ const cyan = (s) => `\x1b[36m${s}\x1b[0m`;
 const red = (s) => `\x1b[31m${s}\x1b[0m`;
 const bold = (s) => `\x1b[1m${s}\x1b[0m`;
 
-const status = await fetch(`${BRIDGE}/status`).then((r) => r.json()).catch(() => null);
+const status = await fetch(`${BRIDGE}/status`, { headers: AUTH }).then((r) => r.json()).catch(() => null);
 if (!status) {
   console.error(red(`No bridge at ${BRIDGE}. Start it with: npm run dev`));
   process.exit(1);
@@ -36,12 +38,12 @@ model ??= status.defaultModel;
 
 if (CONVERSATION) {
   await fetch(`${BRIDGE}/config`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
     body: JSON.stringify({ conversation: CONVERSATION }),
   }).catch(() => {});
 } else if (NEW) {
   const made = await fetch(`${BRIDGE}/conversations/new`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
     body: JSON.stringify({ model, message: 'New chat.' }),
   }).then((r) => r.json()).catch(() => null);
   if (made?.id) status.conversation = made.id;
@@ -50,7 +52,7 @@ if (CONVERSATION) {
 async function ask(text) {
   const res = await fetch(`${BRIDGE}/v1/chat/completions`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...AUTH },
     body: JSON.stringify({ model, stream: true, messages: [{ role: 'user', content: text }] }),
   });
   if (!res.ok) {
@@ -100,14 +102,14 @@ for (;;) {
   if (!line) continue;
 
   if (line === '/models') {
-    const { data } = await fetch(`${BRIDGE}/v1/models`).then((r) => r.json());
+    const { data } = await fetch(`${BRIDGE}/v1/models`, { headers: AUTH }).then((r) => r.json());
     for (const m of data) console.log(`  ${m.id.padEnd(38)} ${m.name}${m.free_credit ? dim('  [free]') : ''}`);
     continue;
   }
   if (line.startsWith('/model ')) {
     model = line.slice(7).trim();
     await fetch(`${BRIDGE}/config`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
       body: JSON.stringify({ defaultModel: model }),
     }).catch(() => {});
     console.log(dim(`  model ${model}`));

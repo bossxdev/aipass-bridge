@@ -17,6 +17,8 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { canonicalize, isDenied } from './security/paths.mjs';
 import { E } from './security/errors.mjs';
+import { redact as redactSensitive } from './security/dlp.mjs';
+import { loadToken } from './security/auth.mjs';
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback = null) => {
@@ -258,11 +260,34 @@ const TOOLS = {
   },
   run(_arg, body) {
     if (!ALLOW_RUN) return 'shell commands are disabled for this run';
+    // Scrub credentials from the child environment. The child inherits only
+    // a safe subset: PATH, HOME, LANG, TERM, USER, LOGNAME, TMPDIR, TZ.
+    // Keys that carry secrets (tokens, passwords, keys, AWS/GCP/Azure creds,
+    // the bridge token itself) are stripped so they cannot be exfiltrated via
+    // environment-printing commands such as `env` or `printenv`.
+    const SAFE_ENV_KEYS = new Set([
+      'PATH', 'HOME', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE',
+      'TERM', 'COLORTERM', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP', 'TZ',
+      'PWD', 'SHELL',
+    ]);
+    const safeEnv = Object.fromEntries(
+      Object.entries(process.env).filter(([k]) => SAFE_ENV_KEYS.has(k)),
+    );
+    let raw;
     try {
-      return clip(execFileSync('/bin/sh', ['-c', body], { cwd: ROOT, encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+      raw = execFileSync('/bin/sh', ['-c', body], {
+        cwd: ROOT,
+        encoding: 'utf8',
+        timeout: 120_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: safeEnv,
+      });
     } catch (err) {
-      return clip(`exit ${err.status}\n${String(err.stdout ?? '')}${String(err.stderr ?? '')}`);
+      raw = `exit ${err.status}\n${String(err.stdout ?? '')}${String(err.stderr ?? '')}`;
     }
+    // Redact secrets/PII from shell output before it enters the prompt.
+    const { text: redacted } = redactSensitive(raw);
+    return clip(redacted);
   },
 };
 
@@ -372,7 +397,10 @@ function parse(reply) {
 async function say(text) {
   const res = await fetch(`${BRIDGE}/v1/chat/completions`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${loadToken()}`,
+    },
     body: JSON.stringify({ ...(MODEL ? { model: MODEL } : {}), stream: true, messages: [{ role: 'user', content: text }] }),
   });
   if (!res.ok) throw new Error(`bridge returned ${res.status}: ${(await res.text()).slice(0, 300)}`);
@@ -436,7 +464,14 @@ function redact(text) {
 }
 
 async function sayResilient(text, depth = 0) {
-  if (depth === 0) text = outbound(text); // encode the whole message once
+  if (depth === 0) {
+    // Final defense-in-depth boundary. Redact assembled prompts (including task
+    // text and listings) before WAF transport substitutions encode them.
+    const redacted = redactSensitive(text);
+    const tally = Object.entries(redacted.counts);
+    if (tally.length) console.log(dim(`  dlp: ${tally.map(([k, n]) => `${k}:${n}`).join(' ')} redacted before send`));
+    text = outbound(redacted.text);
+  }
   try {
     return await say(text);
   } catch (err) {
@@ -489,25 +524,29 @@ function showDiff() {
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 
+const AUTH = { authorization: `Bearer ${loadToken()}` };
 if (CONVERSATION) {
   await fetch(`${BRIDGE}/config`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
     body: JSON.stringify({ conversation: CONVERSATION }),
   }).catch(() => {});
 } else if (!REUSE) {
   const made = await fetch(`${BRIDGE}/conversations/new`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
     body: JSON.stringify({ ...(MODEL ? { model: MODEL } : {}), ...(ASSISTANT ? { assistant: ASSISTANT } : {}), message: 'Starting a new working session.' }),
   }).then((r) => r.json()).catch((err) => ({ error: { message: String(err.message) } }));
   if (made?.error) console.error(red(`could not start a new conversation: ${made.error.message}`));
 }
-const bridgeStatus = await fetch(`${BRIDGE}/status`).then((r) => r.json()).catch(() => null);
+const bridgeStatus = await fetch(`${BRIDGE}/status`, { headers: AUTH }).then((r) => r.json()).catch(() => null);
 
 console.log(bold('root  ') + ROOT);
 console.log(bold('mode  ') + (APPLY ? green('APPLY — files will be written') : 'dry run (pass --apply to write)'));
 console.log(bold('chat  ') + (bridgeStatus?.conversation ?? 'resolves on first message') +
   dim(CONVERSATION ? '  (continuing)' : REUSE ? '  (reusing the most recent)' : '  (new)') +
   (ASSISTANT ? dim(`  · assistant ${ASSISTANT}`) : ''));
+if (REUSE || WATCH || CONVERSATION) {
+  console.warn('warning: this mode reuses upstream conversation history; sensitive data may persist upstream');
+}
 
 const useSlim = SLIM || Boolean(ASSISTANT);
 
@@ -550,9 +589,15 @@ async function runTask(taskText, { first }) {
       let result;
       try { result = TOOLS[call.kind](call.arg, call.body); }
       catch (err) { result = `error: ${err.message}`; }
-      const head = result.split('\n')[0];
-      console.log(`  ${/^(no such|error|the text)/.test(result) ? red('✗') : green('✓')} ${call.kind} ${call.arg} ${dim(head.slice(0, 70))}`);
-      results.push(`Result of ${call.kind} ${call.arg}:\n${outbound(result)}`);
+      // Defense-in-depth: strip secrets/PII from every tool result BEFORE
+      // WAF encoding, so sensitive values never enter the outbound message
+      // even when the file that held them was explicitly allowed.
+      const { text: clean, counts } = redactSensitive(result);
+      const tally = Object.entries(counts);
+      if (tally.length) console.log(dim(`  dlp: ${tally.map(([k, n]) => `${k}:${n}`).join(' ')} redacted in ${call.kind} ${call.arg}`));
+      const head = clean.split('\n')[0];
+      console.log(`  ${/^(no such|error|the text)/.test(clean) ? red('✗') : green('✓')} ${call.kind} ${call.arg} ${dim(head.slice(0, 70))}`);
+      results.push(`Result of ${call.kind} ${call.arg}:\n${outbound(clean)}`);
     }
 
     const stillLooking = work.some((c) => c.kind === 'list' || c.kind === 'read' || c.kind === 'search');

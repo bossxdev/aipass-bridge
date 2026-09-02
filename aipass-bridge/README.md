@@ -387,3 +387,96 @@ filter is being modelled, pass `reject` to refuse payloads matching a pattern.
 - Every message appears in the account's chat history — this uses the real product.
 - Long sessions burn credits. Only `gemini-3.1-flash-lite` is free-credit;
   `npm run models` marks it.
+
+## Security
+
+### Trust boundary
+
+The bridge runs on loopback (`127.0.0.1`) and is the last point at which local
+data can be inspected before it leaves the machine. Three controls apply in
+sequence:
+
+1. **Sensitive-file denylist (agent)** — the agent refuses to read, list, or
+   search files that match sensitive-file patterns: `.env`, `.env.*`, `*.pem`,
+   `*.key`, `*.p12`, `*.pfx`, `*.keystore`, `*.jks`, `id_rsa*`, `id_ed25519*`,
+   `credentials.*`, `secrets.*`, `*_secret.*`, `*.sqlite`, `*.sqlite3`, `*.db`,
+   `.git`. Any path component matching a pattern is blocked, so nested secrets
+   inside subdirectories are covered too. You can grant access to a specific file
+   for a single run with `--allow-path <rel>`.
+2. **DLP redaction (agent + bridge)** — outbound text is scanned for secrets and
+   PII and replaced with `[REDACTED]` before the text becomes a request. Patterns
+   include bearer tokens, AWS/GCP/Azure credentials, private keys, email
+   addresses, credit-card numbers, and SSN-shaped strings. The bridge applies this
+   to every `/v1/chat/completions` request; the agent applies it to every tool
+   result including shell output. Log lines record category hit counts only — the
+   values themselves are never logged.
+3. **WAF encoding (agent outbound)** — a separate layer encodes structural tokens
+   that upstream filters reject (`localhost`, `127.0.0.1`, `file://`, HTML tags,
+   `.env`, `process.env`). This is a transport-compatibility measure, not a
+   security control. Redaction runs before encoding so that a secret is removed
+   before the encoding pass ever touches it.
+
+### Bearer authentication
+
+Every bridge route except `/health` requires a `Bearer` token in the
+`Authorization` header. The token is loaded from `AIPASS_TOKEN` env or
+`~/.aipass-bridge/token` (created with mode `0600` on first run). The
+extension popup has a **Bearer token** field; paste the token value from the
+file or the env and click **Save & reconnect**. The `agent` and `chat` CLIs load
+it automatically via the same env variable.
+
+Error responses use stable machine-readable codes: `auth_required` (missing
+header), `auth_invalid` (wrong token), `origin_forbidden`, `forbidden_path`,
+`not_found`, `upstream_error`, `server_error`. They never echo the request path,
+the token value, or blocked file contents.
+
+### CORS / origin allowlist
+
+The bridge rejects requests from web origins that are not explicitly allowed,
+before authentication runs. Allowed origins are set via
+`AIPASS_ALLOWED_ORIGINS=origin1,origin2` (comma-separated exact strings). Direct
+loopback calls (no `Origin` header) are always allowed. The extension must add
+its own `chrome-extension://<id>` origin to the list. Preflight responses
+reflect the specific allowed origin rather than a wildcard.
+
+### Shell execution
+
+`RUN` commands are disabled by default and require `--allow-run`. When enabled:
+
+- The child process inherits only a safe subset of environment variables (`PATH`,
+  `HOME`, `LANG`, `TERM`, `USER`, `LOGNAME`, `TMPDIR`, `TZ`, and a few related
+  keys). Token, password, cloud-credential, and bridge-token variables are
+  stripped.
+- Shell stdout and stderr pass through DLP redaction before the result enters the
+  upstream prompt.
+
+`--allow-run` is still an arbitrary `/bin/sh -c` invocation with no sandboxing;
+use it only when the source tree is trusted.
+
+### History / data retention
+
+By default the agent starts a fresh conversation for every run, limiting the
+upstream context window to the work in progress. When `--reuse`, `--watch`, or
+`--conversation` is used, the agent prints a warning because those modes carry
+conversation history that the remote service may retain according to its own
+policy. The bridge only forwards the last user message per request; it does not
+accumulate a local history.
+
+### Residual risks
+
+- **Pattern-based DLP is not exhaustive.** New secret formats, obfuscated values,
+  or multi-line secrets may not be matched. Review any `--allow-path` override
+  before use.
+- **Upstream retention.** Once a message leaves the bridge it is subject to
+  de.aipass.net's data-retention policy. There is no mechanism to delete upstream
+  history from this client.
+- **Shell is unsandboxed.** `--allow-run` runs real shell commands. The agent has
+  no way to prevent a compromised or malicious model reply from issuing a
+  destructive command if the flag is set.
+- **Extension ID not pinned.** The CORS allowlist requires the operator to add
+  the extension's `chrome-extension://<id>` origin explicitly. A different
+  installed extension that guesses the bridge URL could call it if the operator
+  mistakenly allows `chrome-extension://` as a prefix match rather than an exact
+  origin.
+- **Token stored at rest.** `~/.aipass-bridge/token` is `0600` but is not
+  encrypted. Access to the file grants full bridge access.

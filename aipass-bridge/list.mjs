@@ -3,10 +3,12 @@
 // liners in package.json, which is a code-execution shape that upstream
 // filters reject when the agent reads its own package.json back.
 const BRIDGE = (process.env.AIPASS_BRIDGE ?? 'http://127.0.0.1:8787').replace(/\/+$/, '');
+const { loadToken } = await import(new URL('./security/auth.mjs', import.meta.url));
+const AUTH = { authorization: `Bearer ${loadToken()}` };
 const what = process.argv[2] ?? 'models';
 
 const get = async (p) => {
-  const res = await fetch(`${BRIDGE}${p}`);
+  const res = await fetch(`${BRIDGE}${p}`, { headers: AUTH });
   if (!res.ok) throw new Error(`bridge returned ${res.status}`);
   return res.json();
 };
