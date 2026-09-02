@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 let bridge = 'http://127.0.0.1:8787';
 let token = '';
 let lastModelSignature = '';
+let savedAt = 0; // timestamp of last Save click — suppress poll overwrites briefly
 const auth = () => ({ authorization: `Bearer ${token}` });
 
 async function bridgeStatus(refresh = false) {
@@ -51,7 +52,7 @@ async function refresh(forceModels = false) {
     `<span class="dot ${sw.connected ? 'up' : 'down'}"></span>${sw.connected ? 'connected' : 'not connected'}`;
   $('tab').textContent = sw.tab ? new URL(sw.tab.url).pathname : 'none open';
   $('jobs').textContent = String(sw.activeJobs);
-  if (document.activeElement !== $('url')) $('url').value = sw.bridgeUrl;
+  if (document.activeElement !== $('url') && Date.now() - savedAt > 2000) $('url').value = sw.bridgeUrl;
 
   const status = await bridgeStatus(forceModels);
   if (status) renderModels(status.models ?? [], status.defaultModel);
@@ -68,6 +69,7 @@ $('model').addEventListener('change', async () => {
 });
 
 $('save').addEventListener('click', async () => {
+  savedAt = Date.now();
   await chrome.storage.local.set({
     bridgeUrl: $('url').value.trim().replace(/\/+$/, ''),
     token: $('token').value.trim(),
