@@ -15,10 +15,10 @@ let lastError = '';
 const jobTabs = new Map();
 
 const bridgeUrl = async () =>
-  (await chrome.storage.local.get('bridgeUrl')).bridgeUrl || DEFAULT_BRIDGE;
+  ((await chrome.storage.local.get('bridgeUrl')).bridgeUrl || DEFAULT_BRIDGE).trim();
 
 // Bearer token set in the popup; every bridge call carries it.
-const bridgeToken = async () => (await chrome.storage.local.get('token')).token || '';
+const bridgeToken = async () => ((await chrome.storage.local.get('token')).token || '').trim();
 
 async function post(path, body) {
   try {
