@@ -29,7 +29,23 @@ test('refuses a request with no extension attached', async () => {
   const res = await post({ messages: [{ role: 'user', content: 'hi' }] });
   assert.equal(res.status, 502);
   const body = await res.json();
+  assert.equal(body.error.code, 'upstream_error');
   assert.match(body.error.message, /no extension connected/);
+});
+
+test('returns stable error codes without echoing request routes', async () => {
+  const bad = await fetch(`${bridge.base}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{',
+  });
+  assert.equal(bad.status, 400);
+  assert.equal((await bad.json()).error.code, 'server_error');
+
+  const missing = await fetch(`${bridge.base}/path-containing-secret-value`);
+  assert.equal(missing.status, 404);
+  const body = await missing.json();
+  assert.equal(body.error.code, 'not_found');
+  assert.equal(body.error.message, 'route not found');
+  assert.doesNotMatch(JSON.stringify(body), /secret-value/);
 });
 
 test('streams text, tool status and a finish reason', async () => {

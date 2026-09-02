@@ -421,17 +421,24 @@ test('the task text and preamble are encoded, so process.env never leaves raw', 
   assert.match(sent, /PROCESS-ENV/, 'it is encoded, not dropped');
 });
 
-test('the model can open a file whose name was encoded (.env → DOT-ENV)', async (t) => {
+test('the model can open a file whose name was encoded (.env → DOT-ENV) only with explicit allow-path', async (t) => {
   const dir = tempDir({ '.env': 'TOKEN=abc\n' });
-  // The model sees the encoded name in the listing and copies it back verbatim.
-  const handler = scripted(['NEED file DOT-ENV', 'DONE read the env file']);
-  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
-  t.after(() => ext.disconnect());
 
+  // Without --allow-path: blocked
+  const blocked = scripted(['NEED file DOT-ENV', 'DONE tried']);
+  const ext1 = await new FakeExtension(bridge.base, { onChat: blocked }).connect();
+  t.after(() => ext1.disconnect());
   await run(AGENT, ['read the env file', '--root', dir, '--bridge', bridge.base]);
-  // the decode step turns DOT-ENV back into .env, so the real file is read
-  const result = handler.sent[1];
-  assert.match(result, /TOKEN=abc/, 'the real .env file was read and its contents returned (encoded)');
+  assert.match(blocked.sent[1], /denylist/, '.env blocked without --allow-path');
+  assert.doesNotMatch(blocked.sent[1], /TOKEN=abc/);
+  await ext1.disconnect();
+
+  // With --allow-path: readable
+  const allowed = scripted(['NEED file DOT-ENV', 'DONE read the env file']);
+  const ext2 = await new FakeExtension(bridge.base, { onChat: allowed }).connect();
+  t.after(() => ext2.disconnect());
+  await run(AGENT, ['read the env file', '--root', dir, '--bridge', bridge.base, '--allow-path', '.env']);
+  assert.match(allowed.sent[1], /TOKEN=abc/, '.env readable with explicit --allow-path');
 });
 
 test('tag-shaped content passes a tag-blocking edge and restores byte-for-byte', async (t) => {

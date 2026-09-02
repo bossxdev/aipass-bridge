@@ -9,6 +9,7 @@
 // for the web UI, so there is nothing to reconstruct on this side.
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { E, errorBody } from '../security/errors.mjs';
 
 const PORT = Number(process.env.AIPASS_PORT ?? 8787);
 const HOST = process.env.AIPASS_HOST ?? '127.0.0.1';
@@ -336,19 +337,19 @@ function json(res, status, obj) {
   res.end(body);
 }
 
-const oaiError = (res, status, message, type = 'invalid_request_error') =>
-  json(res, status, { error: { message, type } });
+const oaiError = (res, status, message, type = 'invalid_request_error', code = E.server_error) =>
+  json(res, status, errorBody(code, message, type));
 
 /* ---------------------------------------------------------- chat completions */
 
 async function chatCompletions(req, res) {
   let payload;
   try { payload = JSON.parse(await readBody(req)); }
-  catch { return oaiError(res, 400, 'invalid JSON body'); }
+  catch { return oaiError(res, 400, 'invalid JSON body', 'invalid_request_error', E.server_error); }
 
   const model = String(payload.model ?? defaultModel).replace(/^aipass\//, '');
   const text = lastUserText(payload.messages);
-  if (!text) return oaiError(res, 400, 'no user message');
+  if (!text) return oaiError(res, 400, 'no user message', 'invalid_request_error', E.server_error);
 
   const id = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -425,7 +426,7 @@ async function chatCompletions(req, res) {
         });
         resolve();
       },
-      onError: (message) => { oaiError(res, 502, message, 'upstream_error'); resolve(); },
+      onError: (message) => { oaiError(res, 502, message, 'upstream_error', E.upstream_error); resolve(); },
     });
     res.on('close', () => { job.abort(); resolve(); });
   });
@@ -552,10 +553,10 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    return oaiError(res, 404, `no route for ${req.method} ${path}`, 'not_found');
+    return oaiError(res, 404, 'route not found', 'not_found', E.not_found);
   } catch (err) {
     log('unhandled', err);
-    if (!res.headersSent) oaiError(res, 500, String(err?.message ?? err), 'server_error');
+    if (!res.headersSent) oaiError(res, 500, 'internal server error', 'server_error', E.server_error);
     else res.end();
   }
 });

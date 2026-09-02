@@ -15,6 +15,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { canonicalize, isDenied } from './security/paths.mjs';
+import { E } from './security/errors.mjs';
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback = null) => {
@@ -22,9 +24,10 @@ const flag = (name, fallback = null) => {
   return i === -1 ? fallback : argv[i + 1];
 };
 const has = (name) => argv.includes(`--${name}`);
+const flags = (name) => argv.flatMap((a, i) => a === `--${name}` && argv[i + 1] ? [argv[i + 1]] : []);
 
 const task = argv.filter((a, i) => !a.startsWith('--') && !argv[i - 1]?.startsWith('--')).join(' ').trim();
-const ROOT = path.resolve(flag('root', process.cwd()));
+const ROOT = fs.realpathSync(path.resolve(flag('root', process.cwd())));
 const BRIDGE = (flag('bridge', 'http://127.0.0.1:8787')).replace(/\/+$/, '');
 const MODEL = flag('model', null);
 const MAX_STEPS = Number(flag('max', 10));
@@ -46,6 +49,10 @@ const WATCH = has('watch');
 // create form uses is set by AIPASS_ASSISTANT_FIELD on the bridge; here we just
 // pass the id through. Implies --slim, since the assistant carries the protocol.
 const ASSISTANT = flag('assistant', process.env.AIPASS_ASSISTANT_ID || null);
+// Explicit, exact-path override of the sensitive-file denylist. Each value is
+// normalized to a POSIX rel path and must match exactly. Never implied by
+// --apply or --watch; passing it is a deliberate, per-run decision.
+const ALLOW_PATHS = new Set(flags('allow-path').map((p) => p.replace(/\\/g, '/').replace(/^\.\//, '')));
 
 if (!task) {
   console.error(`usage: npm run agent -- "<task>" [options]
@@ -70,8 +77,10 @@ const cyan = (s) => `\x1b[36m${s}\x1b[0m`;
 const overlay = new Map();
 
 function safe(p) {
-  const abs = path.resolve(ROOT, p);
-  if (abs !== ROOT && !abs.startsWith(ROOT + path.sep)) throw new Error(`path escapes root: ${p}`);
+  const { abs, rel } = canonicalize(ROOT, p);
+  if (isDenied(rel) && !ALLOW_PATHS.has(rel)) {
+    throw Object.assign(new Error(`forbidden path: ${rel} is on the sensitive-file denylist (explicit --allow-path RELPATH overrides per run)`), { code: E.forbidden_path });
+  }
   return abs;
 }
 const readAt = (abs) => (overlay.has(abs) ? overlay.get(abs) : fs.readFileSync(abs, 'utf8'));
@@ -153,8 +162,13 @@ const inbound = (text) => (text == null ? text : RESTORE.reduce((acc, [re, to]) 
 const TOOLS = {
   list(arg) {
     const abs = safe(arg || '.');
+    const base = path.relative(ROOT, abs).split(path.sep).join('/');
     return clip(fs.readdirSync(abs, { withFileTypes: true })
       .filter((e) => !SKIP.has(e.name))
+      .filter((e) => {
+        const rel = base ? `${base}/${e.name}` : e.name;
+        return ALLOW_PATHS.has(rel) || !isDenied(rel);
+      })
       .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
       .sort().join('\n') || '(empty)');
   },
@@ -211,14 +225,19 @@ const TOOLS = {
     if (!query) return 'give me some text to search for.';
     const needle = inbound(query); // the model may type placeholders like LCLHST
     const hits = [];
+    const visited = new Set();
     const MAX = 50;
     const walk = (dir) => {
-      if (hits.length >= MAX) return;
+      if (hits.length >= MAX || visited.has(dir)) return;
+      visited.add(dir);
       let entries;
       try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
       for (const e of entries) {
         if (SKIP.has(e.name) || e.name.startsWith('.')) continue;
-        const full = path.join(dir, e.name);
+        // safe() canonicalizes through symlinks and applies the denylist, so a
+        // linked dir escaping root or a denied file is skipped, never read.
+        let full;
+        try { full = safe(path.join(dir, e.name)); } catch { continue; }
         if (e.isDirectory()) { walk(full); continue; }
         if (hits.length >= MAX) return;
         let text;
@@ -232,7 +251,7 @@ const TOOLS = {
         }
       }
     };
-    walk(ROOT);
+    walk(fs.realpathSync(ROOT));
     if (!hits.length) return `no matches for "${query}".`;
     const more = hits.length >= MAX ? `\n… stopped at ${MAX} matches; make the search more specific for the rest.` : '';
     return hits.join('\n') + more;
