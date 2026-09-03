@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const source = await readFile(new URL('../extension/background.js', import.meta.url), 'utf8');
 
-function load({ fetch, sendMessage = async () => ({ ok: true }) } = {}) {
+function load({ fetch, sendMessage = async () => ({ ok: true }), query = async () => [], create } = {}) {
   const noopEvent = { addListener() {}, removeListener() {} };
   const chrome = {
     storage: { local: { get: async (key) => key === 'bridgeUrl'
@@ -13,7 +13,8 @@ function load({ fetch, sendMessage = async () => ({ ok: true }) } = {}) {
       : { token: 'secret-test-token' } } },
     tabs: {
       sendMessage,
-      query: async () => [],
+      query,
+      create,
       reload: async () => {},
       onUpdated: noopEvent,
     },
@@ -71,4 +72,30 @@ test('final POST failure exposes path and status only', async () => {
   assert.equal(calls, 3);
   assert.equal(api.status().lastError, 'bridge POST /ext/error returned 401');
   assert.doesNotMatch(api.status().lastError, /secret|sensitive|token/i);
+});
+
+test('job with no chat tab creates one and dispatches into it', async () => {
+  const created = [];
+  const dispatched = [];
+  const { api } = load({
+    fetch: async () => new Response(null, { status: 204 }),
+    query: async () => [],
+    create: async (props) => {
+      const tab = { id: 42, status: 'complete', discarded: false, url: props.url, ...props };
+      created.push(tab.url);
+      return tab;
+    },
+    sendMessage: async (tabId, msg) => {
+      if (msg?.type === 'ping') return { ok: true };
+      dispatched.push({ tabId, type: msg?.type });
+      return { ok: true };
+    },
+  });
+
+  await api.handleJob({ jobId: 'job-2' });
+
+  assert.equal(created.length, 1);
+  assert.equal(created[0], 'https://de.aipass.net/chat');
+  assert.equal(dispatched.at(-1).tabId, 42);
+  assert.equal(dispatched.at(-1).type, 'run');
 });

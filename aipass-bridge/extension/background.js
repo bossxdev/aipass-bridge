@@ -97,13 +97,17 @@ async function ensureContentScript(tab) {
 }
 
 async function handleJob(job) {
-  const tab = await findChatTab();
+  const tab = (await findChatTab())
+    // After a reboot the watchdog may not have opened the tab yet; create it
+    // instead of failing the job. Focused window keeps Chrome in the background.
+    ?? (await chrome.tabs.create({ url: 'https://de.aipass.net/chat', active: false }));
   if (!tab) {
-    await post('/ext/error', { jobId: job.jobId, message: 'no de.aipass.net tab is open' });
+    await post('/ext/error', { jobId: job.jobId, message: 'could not open a de.aipass.net tab' });
     return;
   }
   jobTabs.set(job.jobId, tab.id);
   try {
+    if (tab.status !== 'complete') await waitForComplete(tab.id).catch(() => {});
     await ensureContentScript(tab);
     await chrome.tabs.sendMessage(tab.id, { type: 'run', job });
   } catch (err) {
@@ -224,6 +228,7 @@ if (globalThis.__AIPASS_BRIDGE_TEST__) {
   globalThis.__aipassBridgeTest = {
     post,
     ensureContentScript,
+    handleJob,
     status: () => ({ lastError }),
   };
 } else {
