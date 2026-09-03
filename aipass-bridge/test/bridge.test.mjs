@@ -124,6 +124,21 @@ test('strips instructions block from multi-part content array', async () => {
   await ext.disconnect();
 });
 
+test('falls back to an earlier user turn when the newest strips to empty', async () => {
+  const handler = scripted(['ok']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+
+  await post({
+    messages: [
+      { role: 'user', content: 'the real question' },
+      { role: 'user', content: '<instructions>\nonly hook output here\n</instructions>\n' },
+    ],
+  });
+
+  assert.equal(handler.sent.at(-1), 'the real question');
+  await ext.disconnect();
+});
+
 test('non-streaming returns a complete message with usage', async () => {
   const ext = await new FakeExtension(bridge.base, {
     onChat: async (_j, e) => { await e.text('the answer'); await e.done(); },

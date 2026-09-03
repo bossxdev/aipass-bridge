@@ -314,7 +314,9 @@ function stripInjectedInstructions(text) {
 }
 
 // Only the newest user message is sent. The server holds the history, and a
-// messages array containing an assistant turn is rejected upstream.
+// messages array containing an assistant turn is rejected upstream. A turn
+// that is pure hook instructions strips to nothing; fall back to the newest
+// turn that still carries real user text.
 function lastUserText(messages) {
   const texts = (messages ?? [])
     .filter((m) => m.role === 'user')
@@ -323,8 +325,9 @@ function lastUserText(messages) {
         ? m.content
         : (m.content ?? []).map((p) => (p?.type === 'text' ? p.text : '')).join('');
       return stripInjectedInstructions(raw);
-    });
-  return texts.at(-1)?.trim() ?? '';
+    })
+    .filter((t) => t.trim());
+  return texts.at(-1) ?? '';
 }
 
 /* ------------------------------------------------------------ http plumbing */
