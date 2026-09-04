@@ -20,12 +20,21 @@ const BRIDGE = 'http://127.0.0.1:8788'; // container 8787 -> host 8788
 const setup = process.argv.includes('--setup');
 
 // Read once; never printed, never written to the repo.
+// Retry up to 10× with 3 s delay — container may not be ready yet at boot.
 let token = '';
-try {
-  token = execFileSync('docker', ['exec', 'aipass-bridge', 'cat', '/home/bridge/.aipass-bridge/token'],
-    { encoding: 'utf8' }).trim();
-} catch {
-  console.error('warning: could not read bridge token via docker exec — set it in the extension popup');
+for (let attempt = 1; attempt <= 10; attempt++) {
+  try {
+    token = execFileSync('docker', ['exec', 'aipass-bridge', 'cat', '/home/bridge/.aipass-bridge/token'],
+      { encoding: 'utf8' }).trim();
+    break; // success
+  } catch {
+    if (attempt < 10) {
+      console.error(`warning: bridge token read attempt ${attempt}/10 failed — retrying in 3 s`);
+      execFileSync('sleep', ['3']);
+    } else {
+      console.error('warning: could not read bridge token via docker exec — set it in the extension popup');
+    }
+  }
 }
 
 const ctx = await chromium.launchPersistentContext(PROFILE, {

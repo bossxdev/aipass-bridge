@@ -11,7 +11,10 @@ import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { E, errorBody } from '../security/errors.mjs';
 import { redact } from '../security/dlp.mjs';
-import { checkAuth, loadToken, tokenFilePath } from '../security/auth.mjs';
+import {
+  checkAuth, mintKey, isMintedKey, conversationForKey,
+  setConversationForKey, loadToken, tokenFilePath,
+} from '../security/auth.mjs';
 import { originAllowed, corsHeaders, preflightHeaders, rejectOrigin } from '../security/cors.mjs';
 
 const PORT = Number(process.env.AIPASS_PORT ?? 8787);
@@ -67,6 +70,7 @@ function decodeTurboStream(text) {
 const LOADERS = {
   models: '/loaders/list-models.data?_routes=routes%2Floaders%2Flist-models',
   conversations: '/loaders/list-conversations.data?_routes=routes%2Floaders%2Flist-converstaions',
+  usage: '/loaders/get-usage-quota',
 };
 
 // list-models carries no field separating chat models from image/video/audio
@@ -202,15 +206,65 @@ async function listModels({ force = false } = {}) {
   return modelRefresh;
 }
 
+/* ------------------------------------------------------------------ usage */
+
+// The public frontend reads only creditStatus.credits.available|limit and
+// creditStatus.periodEndsAt. Keep that narrow path; unrelated numbers in the
+// loader payload must never become usage. `creditsDecimals` controls display
+// precision, not numeric scaling.
+function extractQuota(decoded) {
+  let cs = null;
+  const walk = (v) => {
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== 'object') return;
+    if (!cs && v.creditStatus && typeof v.creditStatus === 'object') cs = v.creditStatus;
+    Object.values(v).forEach(walk);
+  };
+  walk(decoded);
+  const available = Number(cs?.credits?.available);
+  if (!Number.isFinite(available)) return null;
+
+  const limit = 10_000;
+  const remaining = Math.min(limit, Math.max(0, available));
+  const used = limit - remaining;
+  const resetMs = Date.parse(cs.periodEndsAt ?? '');
+  return {
+    limit,
+    remaining,
+    used,
+    usedPercent: used / limit * 100,
+    resetsAt: Number.isFinite(resetMs) ? new Date(resetMs).toISOString() : null,
+  };
+}
+
+async function usageQuota() {
+  if (!extClients.size) throw new Error('no extension connected — cannot read usage');
+  const quota = extractQuota(decodeTurboStream(await fetchLoader(LOADERS.usage)));
+  if (!quota) throw new Error('usage data unavailable');
+  return quota;
+}
+
 /* ----------------------------------------------------------- conversations */
 
 // Conversations are created by the server; posting to an invented id is
 // rejected. Reuse the most recent, and move on if one stops accepting messages.
-let conversationCache = null;
-let conversationList = [];
-let conversationIndex = 0;
+// State is per API key, so each client session gets its own upstream
+// conversation instead of sharing one.
+const convState = new Map();
+// isolated: created by mintKey — never falls through to account-wide history.
+const stateFor = (key) => {
+  let s = convState.get(key);
+  if (!s) {
+    const isolated = isMintedKey(key);
+    convState.set(key, (s = {
+      cache: isolated ? conversationForKey(key) : null,
+      list: [], index: 0, isolated,
+    }));
+  }
+  return s;
+};
 
-async function loadConversations() {
+async function loadConversations(key) {
   if (!extClients.size) throw new Error('no extension connected — cannot look up a conversation');
   const decoded = decodeTurboStream(await fetchLoader(LOADERS.conversations));
   const list = [];
@@ -222,7 +276,7 @@ async function loadConversations() {
   };
   walk(decoded);
   list.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
-  conversationList = list;
+  stateFor(key).list = list;
   return list;
 }
 
@@ -239,7 +293,7 @@ function findValue(node, key) {
 
 // The chat page creates a conversation by posting its first message to
 // /chat.data; the server derives the id from clientCreateRequestId.
-async function createConversation({ modelId = defaultModel, message = 'Hello', assistant } = {}) {
+async function createConversation(key, { modelId = defaultModel, message = 'Hello', assistant } = {}) {
   const requestId = randomUUID();
   const raw = await new Promise((resolve, reject) => {
     const job = new Job({
@@ -251,34 +305,39 @@ async function createConversation({ modelId = defaultModel, message = 'Hello', a
     job.dispatch();
   });
   const id = findValue(decodeTurboStream(raw), 'conversationId');
-  if (!id) throw new Error(`could not read a conversation id from the response: ${raw.slice(0, 200)}`);
-  conversationCache = id;
-  conversationIndex = 0;
-  conversationList = [];
-  log(`created conversation ${id}`);
+  if (!id) throw new Error('could not read a conversation id from the response');
+  const s = stateFor(key);
+  s.cache = id;
+  s.index = 0;
+  s.list = [];
+  if (s.isolated) setConversationForKey(key, id);
+  log('created conversation');
   return id;
 }
 
-async function resolveConversation() {
+async function resolveConversation(key) {
   if (PINNED_CONVERSATION) return PINNED_CONVERSATION;
-  if (conversationCache) return conversationCache;
-  if (!conversationList.length) await loadConversations();
-  const pick = conversationList[conversationIndex];
+  const s = stateFor(key);
+  if (s.cache) return s.cache;
+  // Isolated (minted) keys always get their own fresh upstream conversation —
+  // never falling through to account-wide history.
+  if (s.isolated) return createConversation(key, { modelId: defaultModel });
+  if (!s.list.length) await loadConversations(key);
+  const pick = s.list[s.index];
   if (!pick) {
     // Fresh account or everything deleted: create one instead of failing.
-    if (PINNED_CONVERSATION) throw new Error('pinned conversation does not exist');
-    return createConversation({ modelId: defaultModel });
+    return createConversation(key, { modelId: defaultModel });
   }
-  conversationCache = pick.id;
-  log(`conversation ${conversationCache} (${pick.title ?? 'untitled'})`);
-  return conversationCache;
+  s.cache = pick.id;
+  log('conversation selected from account history');
+  return s.cache;
 }
 
 /* --------------------------------------------------------------- chat flow */
 
 // A 404 means the conversation was deleted; a 409 means the server still
 // believes a generation is running there. Neither recovers on its own.
-function startChat({ modelId, text, onDelta, onDone, onError }) {
+function startChat({ key, modelId, text, onDelta, onDone, onError }) {
   let attempts = 0;
   let delivered = 0;
   let current = null;
@@ -286,7 +345,7 @@ function startChat({ modelId, text, onDelta, onDone, onError }) {
   const attempt = async () => {
     attempts++;
     let conversationId;
-    try { conversationId = await resolveConversation(); }
+    try { conversationId = await resolveConversation(key); }
     catch (err) { return onError(err.message); }
 
     current = new Job({
@@ -294,11 +353,13 @@ function startChat({ modelId, text, onDelta, onDone, onError }) {
       onDelta: (part) => { delivered++; onDelta(part); },
       onDone,
       onError: (message) => {
-        const rejected = /conversation not found|returned 404|returned 409/i.test(message);
+        const rejected = /conversation not found|returned 403|returned 404|returned 409/i.test(message);
         if (rejected && attempts <= 3 && delivered === 0 && !PINNED_CONVERSATION) {
-          log(`conversation ${conversationId} rejected, trying the next one`);
-          conversationIndex++;
-          conversationCache = null;
+          log('conversation rejected, trying the next one');
+          const s = stateFor(key);
+          s.index++;
+          s.cache = null;
+          if (s.isolated) setConversationForKey(key, null);
           attempt();
           return;
         }
@@ -368,7 +429,7 @@ const oaiError = (res, status, message, type = 'invalid_request_error', code = E
 
 /* ---------------------------------------------------------- chat completions */
 
-async function chatCompletions(req, res) {
+async function chatCompletions(req, res, key) {
   let payload;
   try { payload = JSON.parse(await readBody(req)); }
   catch { return oaiError(res, 400, 'invalid JSON body', 'invalid_request_error', E.server_error); }
@@ -404,7 +465,7 @@ async function chatCompletions(req, res) {
     emit({ role: 'assistant', content: '' });
 
     const job = startChat({
-      modelId: model, text,
+      key, modelId: model, text,
       onDelta: (part) => {
         if (part.kind === 'status') {
           if (TOOL_VISIBILITY === 'off') return;
@@ -434,7 +495,7 @@ async function chatCompletions(req, res) {
   let reasoning = '';
   await new Promise((resolve) => {
     const job = startChat({
-      modelId: model, text,
+      key, modelId: model, text,
       onDelta: (p) => {
         if (p.kind === 'status') { if (TOOL_VISIBILITY !== 'off') reasoning += `${p.text}\n`; return; }
         if (p.kind === 'reasoning') reasoning += p.text;
@@ -527,18 +588,32 @@ const server = http.createServer(async (req, res) => {
   // Minimal health probe is the sole unauthenticated route.
   if (path === '/health') return json(res, 200, { ok: true });
 
-  // Every other route requires a valid Bearer token.
-  const authResult = checkAuth(req);
-  if (authResult !== true) {
+  // Every other route requires a valid Bearer key; key === the bearer string.
+  const key = checkAuth(req);
+  if (key === 'missing' || key === 'invalid') {
     return json(res, 401, errorBody(
-      authResult === 'missing' ? E.auth_required : E.auth_invalid,
-      authResult === 'missing' ? 'authorization header required' : 'invalid bearer token',
+      key === 'missing' ? E.auth_required : E.auth_invalid,
+      key === 'missing' ? 'authorization header required' : 'invalid bearer token',
       'authentication_error',
     ));
   }
 
   try {
-    if (path === '/v1/chat/completions' && req.method === 'POST') return await chatCompletions(req, res);
+    if (path === '/keys' && req.method === 'POST') {
+      // Mint a session key. Main token only; minted keys cannot mint more.
+      // The key is returned once, never logged; it persists in the keys file.
+      if (key !== loadToken()) return json(res, 403, { error: 'main token required' });
+      const minted = mintKey();
+      convState.set(minted, { cache: null, list: [], index: 0, isolated: true });
+      return json(res, 200, { key: minted });
+    }
+
+    if (path === '/v1/chat/completions' && req.method === 'POST') return await chatCompletions(req, res, key);
+
+    if (path === '/v1/usage' && req.method === 'GET') {
+      try { return json(res, 200, await usageQuota()); }
+      catch { return oaiError(res, 502, 'usage data unavailable', 'upstream_error', E.upstream_error); }
+    }
 
     if (path === '/v1/models') {
       const models = await listModels({ force: url.searchParams.get('refresh') === '1' });
@@ -553,14 +628,15 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/conversations/new' && req.method === 'POST') {
       const body = JSON.parse(await readBody(req) || '{}');
-      const id = await createConversation({ modelId: body.model, message: body.message, assistant: body.assistant });
+      const id = await createConversation(key, { modelId: body.model, message: body.message, assistant: body.assistant });
       return json(res, 200, { id });
     }
     if (path === '/conversations') {
-      await loadConversations().catch(() => {});
+      await loadConversations(key).catch(() => {});
+      const s = stateFor(key);
       return json(res, 200, {
-        current: PINNED_CONVERSATION || conversationCache,
-        conversations: conversationList.map((c) => ({ id: c.id, title: c.title, updatedAt: c.updatedAt })),
+        current: PINNED_CONVERSATION || s.cache,
+        conversations: s.list.map((c) => ({ id: c.id, title: c.title, updatedAt: c.updatedAt })),
       });
     }
 
@@ -572,12 +648,15 @@ const server = http.createServer(async (req, res) => {
       }
       if (typeof body.assistant === 'string') { assistantId = body.assistant.trim(); log(assistantId ? `assistant ${assistantId}` : 'assistant cleared'); }
       if (body.conversation === null || typeof body.conversation === 'string') {
-        conversationCache = body.conversation || null;
-        conversationIndex = 0;
-        if (!conversationCache) conversationList = [];
-        log(conversationCache ? `conversation ${conversationCache}` : 'conversation cleared');
+        const s = stateFor(key);
+        s.cache = body.conversation || null;
+        s.index = 0;
+        if (!s.cache) s.list = [];
+        if (s.isolated) setConversationForKey(key, s.cache);
+        log(s.cache ? 'conversation set' : 'conversation cleared');
       }
-      return json(res, 200, { ok: true, defaultModel, assistant: assistantId || null, conversation: PINNED_CONVERSATION || conversationCache });
+      const s = stateFor(key);
+      return json(res, 200, { ok: true, defaultModel, assistant: assistantId || null, conversation: PINNED_CONVERSATION || s.cache });
     }
 
     if (path === '/ext/events' && req.method === 'GET') return extEvents(req, res);
@@ -595,12 +674,13 @@ const server = http.createServer(async (req, res) => {
     if (path === '/ext/loader' && req.method === 'POST') return await extPost(req, res, 'loader');
 
     if (path === '/status') {
+      const s = stateFor(key);
       return json(res, 200, {
         ok: true,
         extensions: extClients.size,
         activeJobs: jobs.size,
         defaultModel,
-        conversation: PINNED_CONVERSATION || conversationCache,
+        conversation: PINNED_CONVERSATION || s.cache,
         assistant: assistantId || null,
         models: cachedModels(),
       });

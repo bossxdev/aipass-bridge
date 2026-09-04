@@ -33,12 +33,14 @@ export async function waitFor(check, { timeout = 5000, every = 25 } = {}) {
 
 export async function startBridge(env = {}) {
   const port = await freePort();
-  // Fresh token per bridge instance so tests never share credentials.
+  // Fresh token and minted-key file per bridge unless a restart test supplies
+  // the same AIPASS_KEYS_FILE to both instances.
   const token = 'test-token-' + Math.random().toString(36).slice(2);
+  const keysFile = env.AIPASS_KEYS_FILE ?? path.join(tempDir(), 'keys');
   // Child CLIs spawned by tests inherit this token.
   process.env.AIPASS_TOKEN = token;
   const child = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, AIPASS_PORT: String(port), AIPASS_TOKEN: token, ...env },
+    env: { ...process.env, AIPASS_PORT: String(port), AIPASS_TOKEN: token, AIPASS_KEYS_FILE: keysFile, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const log = [];
@@ -91,6 +93,17 @@ export const conversationsFixture = (conversations) => encodeTurboStream({
   'routes/loaders/list-converstaions': { data: { conversations, gatewayFlash: null } },
 });
 
+export const usageFixture = ({ available = '10000', limit = '10000', periodEndsAt } = {}) => encodeTurboStream({
+  data: {
+    success: true,
+    creditStatus: {
+      credits: { available, limit },
+      creditsDecimals: 2,
+      ...(periodEndsAt ? { periodEndsAt } : {}),
+    },
+  },
+});
+
 // The real response derives the id from the first 16 hex characters of the
 // clientCreateRequestId, so the fake does the same.
 export const createFixture = (requestId, initialMessage) => encodeTurboStream({
@@ -115,10 +128,11 @@ const DEFAULT_CONVERSATIONS = [
 // Stands in for the extension. `onChat` receives the job plus an emitter and
 // decides what the upstream would have streamed back.
 export class FakeExtension {
-  constructor(base, { onChat, models = DEFAULT_MODELS, conversations = DEFAULT_CONVERSATIONS, token } = {}) {
+  constructor(base, { onChat, onLoader, models = DEFAULT_MODELS, conversations = DEFAULT_CONVERSATIONS, token } = {}) {
     this.base = base;
     this.token = token ?? process.env.AIPASS_TOKEN ?? '';
     this.onChat = onChat ?? (async (_job, e) => { await e.text('ok'); await e.done(); });
+    this.onLoader = onLoader;
     this.models = models;
     this.conversations = conversations;
     this.chats = [];
@@ -194,6 +208,13 @@ export class FakeExtension {
     }
     if (job.kind === 'loader') {
       this.loaders.push(job.url);
+      if (this.onLoader) {
+        const result = await this.onLoader(job);
+        return void this.post('/ext/loader', {
+          jobId: job.jobId,
+          ...(typeof result === 'string' ? { raw: result } : { message: result?.message ?? 'loader fetch failed' }),
+        });
+      }
       const raw = job.url.includes('list-conversations')
         ? conversationsFixture(this.conversations)
         : modelsFixture(this.models);

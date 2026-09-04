@@ -1,6 +1,9 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { startBridge, FakeExtension, scripted, waitFor } from './harness.mjs';
+import {
+  startBridge, FakeExtension, scripted, tempDir, waitFor,
+  encodeTurboStream, usageFixture,
+} from './harness.mjs';
 
 let bridge;
 before(async () => { bridge = await startBridge(); });
@@ -8,9 +11,11 @@ after(() => bridge.stop());
 
 const auth = () => ({ authorization: `Bearer ${bridge.token}` });
 
-const post = (body) => fetch(`${bridge.base}/v1/chat/completions`, {
+const keyedAuth = (key = bridge.token) => ({ authorization: `Bearer ${key}` });
+
+const post = (body, key = bridge.token) => fetch(`${bridge.base}/v1/chat/completions`, {
   method: 'POST',
-  headers: { 'content-type': 'application/json', authorization: `Bearer ${bridge.token}` },
+  headers: { 'content-type': 'application/json', ...keyedAuth(key) },
   body: JSON.stringify(body),
 });
 
@@ -279,4 +284,278 @@ test('creates a conversation and adopts it', async (t) => {
 
   await post({ messages: [{ role: 'user', content: 'hi' }] });
   assert.equal(ext.chats.at(-1).conversationId, made.id, 'chats go to the new conversation');
+});
+
+// ------------------------------------------------------------------- usage
+
+test('/v1/usage requires auth and reports normalized quota', async (t) => {
+  const unauth = await fetch(`${bridge.base}/v1/usage`);
+  assert.equal(unauth.status, 401);
+
+  const ext = await new FakeExtension(bridge.base, {
+    onLoader: (job) => (job.url.includes('get-usage-quota')
+      ? usageFixture({ available: '7500', limit: '10000', periodEndsAt: '2026-09-04T23:59:59.000Z' })
+      : undefined),
+  }).connect();
+  // undefined falls through to the default fixtures; only quota is scripted.
+  t.after(() => ext.disconnect());
+
+  const r = await fetch(`${bridge.base}/v1/usage`, { headers: auth() });
+  assert.equal(r.status, 200);
+  const q = await r.json();
+  assert.equal(q.limit, 10000);
+  assert.equal(q.remaining, 7500);
+  assert.equal(q.used, 2500);
+  assert.equal(q.usedPercent, 25);
+  assert.equal(q.resetsAt, '2026-09-04T23:59:59.000Z');
+  assert.ok(ext.loaders.some((u) => u.includes('get-usage-quota')), 'quota goes through the loader channel');
+});
+
+test('/v1/usage clamps and survives odd upstream values', async (t) => {
+  const cases = [
+    { in: { available: '12000' }, out: { remaining: 10000, used: 0, usedPercent: 0 } },   // over limit
+    { in: { available: '-5' }, out: { remaining: 0, used: 10000, usedPercent: 100 } },    // negative
+    { in: { available: 3250.5 }, out: { remaining: 3250.5, used: 6749.5, usedPercent: 67.495 } }, // number, no reset
+  ];
+  let i = 0;
+  const ext = await new FakeExtension(bridge.base, {
+    onLoader: (job) => (job.url.includes('get-usage-quota')
+      ? usageFixture(cases[i].in)
+      : undefined),
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  for (i = 0; i < cases.length; i++) {
+    const q = await (await fetch(`${bridge.base}/v1/usage`, { headers: auth() })).json();
+    assert.equal(q.remaining, cases[i].out.remaining);
+    assert.equal(q.used, cases[i].out.used);
+    assert.equal(q.usedPercent, cases[i].out.usedPercent);
+    assert.equal(q.resetsAt, null);
+  }
+});
+
+test('/v1/usage fails closed on malformed or unavailable data', async (t) => {
+  // no extension
+  const noExt = await fetch(`${bridge.base}/v1/usage`, { headers: auth() });
+  assert.equal(noExt.status, 502);
+  const body = await noExt.json();
+  assert.match(body.error.message, /usage data unavailable/);
+  assert.doesNotMatch(JSON.stringify(body), /creditStatus|"available"|"limit"/, 'no upstream data echoed');
+
+  const ext = await new FakeExtension(bridge.base, {
+    onLoader: (job) => (job.url.includes('get-usage-quota') ? encodeTurboStream({ data: { success: false } }) : undefined),
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const bad = await fetch(`${bridge.base}/v1/usage`, { headers: auth() });
+  assert.equal(bad.status, 502);
+  assert.match((await bad.json()).error.message, /usage data unavailable/);
+
+  const logs = bridge.logText();
+  assert.doesNotMatch(logs, /creditStatus|credits/, 'no quota payload leaked into logs');
+});
+
+// ---------------------------------------------------------------- multi-key
+
+async function mintKey() {
+  const r = await fetch(`${bridge.base}/keys`, { method: 'POST', headers: auth() });
+  assert.equal(r.status, 200);
+  return (await r.json()).key;
+}
+
+test('minted keys authenticate and are rejected when wrong', async (t) => {
+  const ext = await new FakeExtension(bridge.base, { onChat: scripted(['ok']) }).connect();
+  t.after(() => ext.disconnect());
+
+  const key = await mintKey();
+  const body = await (await post({ messages: [{ role: 'user', content: 'hi' }] }, key)).json();
+  assert.equal(body.choices[0].message.content, 'ok');
+
+  const bad = await post({ messages: [{ role: 'user', content: 'hi' }] }, key.slice(0, -1) + '0');
+  assert.equal(bad.status, 401);
+});
+
+test('minted keys cannot mint further keys', async () => {
+  const key = await mintKey();
+  const r = await fetch(`${bridge.base}/keys`, { method: 'POST', headers: keyedAuth(key) });
+  assert.equal(r.status, 403);
+});
+
+test('two minted keys get distinct upstream conversations', async (t) => {
+  const handler = scripted(['ok']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  const k1 = await mintKey();
+  const k2 = await mintKey();
+
+  await post({ messages: [{ role: 'user', content: 'one' }] }, k1);
+  await post({ messages: [{ role: 'user', content: 'two' }] }, k2);
+
+  const c1 = ext.chats.at(-2).conversationId;
+  const c2 = ext.chats.at(-1).conversationId;
+  assert.notEqual(c1, c2, 'each key must own its own conversation');
+  assert.ok(ext.created.length >= 2, 'both conversations were created fresh, not reused');
+
+  // follow-ups stay in the assigned conversation
+  await post({ messages: [{ role: 'user', content: 'again' }] }, k1);
+  assert.equal(ext.chats.at(-1).conversationId, c1);
+});
+
+test('main token keeps reusing the newest account conversation', async (t) => {
+  const handler = scripted(['ok']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  await fetch(`${bridge.base}/config`, {
+    method: 'POST', headers: { 'content-type': 'application/json', ...auth() }, body: JSON.stringify({ conversation: null }),
+  });
+
+  const body = await (await post({ messages: [{ role: 'user', content: 'hi' }] })).json();
+  assert.equal(body.choices[0].message.content, 'ok');
+  assert.equal(ext.chats.at(-1).conversationId, 'aaaa1111aaaa1111', 'legacy behaviour: newest account conversation');
+  assert.equal(ext.created.length, 0, 'no conversation created for the main token');
+});
+
+test('clearing the conversation on one minted key does not affect the other', async (t) => {
+  const handler = scripted(['ok']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  const k1 = await mintKey();
+  const k2 = await mintKey();
+
+  await post({ messages: [{ role: 'user', content: 'one' }] }, k1);
+  const c1 = ext.chats.at(-1).conversationId;
+
+  await fetch(`${bridge.base}/config`, {
+    method: 'POST', headers: { 'content-type': 'application/json', ...keyedAuth(k1) }, body: JSON.stringify({ conversation: null }),
+  });
+
+  const status1 = await (await fetch(`${bridge.base}/status`, { headers: keyedAuth(k1) })).json();
+  assert.equal(status1.conversation, null);
+
+  const status2 = await (await fetch(`${bridge.base}/status`, { headers: keyedAuth(k2) })).json();
+  assert.equal(status2.conversation, null, 'k2 has not been used yet either');
+
+  // k1 clear → next use creates a NEW conversation, not k2's and not an account one
+  await post({ messages: [{ role: 'user', content: 'fresh' }] }, k1);
+  const c1new = ext.chats.at(-1).conversationId;
+  assert.notEqual(c1new, c1, 'clearing an isolated key must not reuse its own old conversation');
+});
+
+test('a rejected conversation on a minted key creates a fresh one', async (t) => {
+  // reject the first conversation a key uses, then accept the replacement
+  let first = true;
+  const handler = async (job, e) => {
+    if (first) { first = false; return void e.error('conversation not found'); }
+    await e.text('ok');
+    await e.done();
+  };
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  const k = await mintKey();
+  const out = await readStream(await post({ stream: true, messages: [{ role: 'user', content: 'hi' }] }, k));
+  assert.equal(out.content, 'ok');
+  assert.equal(ext.created.length, 2, 'rejection on an isolated key creates a new conversation, not account rotation');
+});
+
+test('keys and conversation ids never appear in logs', async (t) => {
+  const handler = scripted(['ok']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  const key = await mintKey();
+  await post({ messages: [{ role: 'user', content: 'hi' }] }, key);
+  await waitFor(() => ext.chats.length > 0);
+
+  const logs = bridge.logText();
+  assert.doesNotMatch(logs, new RegExp(key), 'minted key must not be logged');
+  assert.doesNotMatch(logs, new RegExp(ext.chats.at(-1).conversationId), 'conversation id must not be logged');
+  assert.ok(logs.length > 0, 'the bridge does log something (sanity)');
+});
+
+test('minted keys survive a bridge restart', async (t) => {
+  const keysFile = `${tempDir()}/keys`;
+  const mainToken = 'restart-test-main-token';
+  const env = { AIPASS_KEYS_FILE: keysFile, AIPASS_TOKEN: mainToken };
+
+  const b2 = await startBridge(env);
+  const minted = await fetch(`${b2.base}/keys`, {
+    method: 'POST', headers: { authorization: `Bearer ${mainToken}` },
+  });
+  assert.equal(minted.status, 200);
+  const key = (await minted.json()).key;
+  b2.stop(); // SIGKILL — mint must have flushed key synchronously
+
+  const b3 = await startBridge(env);
+  t.after(() => b3.stop());
+  const status = await fetch(`${b3.base}/status`, {
+    headers: { authorization: `Bearer ${key}` },
+  });
+  assert.equal(status.status, 200, 'persisted key authenticates after restart');
+});
+
+test('a minted key resumes its conversation across restarts, and a deleted one is replaced', async (t) => {
+  const keysFile = `${tempDir()}/keys`;
+  const mainToken = 'restart-continuity-main-token';
+  const env = { AIPASS_KEYS_FILE: keysFile, AIPASS_TOKEN: mainToken };
+
+  // First life: mint, chat, capture the conversation the key owns.
+  const b1 = await startBridge(env);
+  const handler = scripted(['ok']);
+  const ext1 = await new FakeExtension(b1.base, { onChat: handler, token: mainToken }).connect();
+  const key = (await (await fetch(`${b1.base}/keys`, {
+    method: 'POST', headers: { authorization: `Bearer ${mainToken}` },
+  })).json()).key;
+  const r1 = await fetch(`${b1.base}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'first' }] }),
+  });
+  assert.equal((await r1.json()).choices[0].message.content, 'ok');
+  const original = ext1.chats.at(-1).conversationId;
+  assert.ok(original);
+  const otherKey = (await (await fetch(`${b1.base}/keys`, {
+    method: 'POST', headers: { authorization: `Bearer ${mainToken}` },
+  })).json()).key;
+  await fetch(`${b1.base}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${otherKey}` },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'other' }] }),
+  });
+  const otherConversation = ext1.chats.at(-1).conversationId;
+  assert.notEqual(otherConversation, original);
+  await ext1.disconnect();
+  b1.stop(); // SIGKILL: mappings must already be flushed
+
+  // Second life: same keys file → same conversation, no new create job.
+  const b2 = await startBridge(env);
+  const rejected = new Set([original]);
+  const handler2 = async (job, e) => {
+    if (rejected.has(job.conversationId)) return void e.error('conversation not found');
+    await e.text('ok'); await e.done();
+  };
+  const ext2 = await new FakeExtension(b2.base, { onChat: handler2, token: mainToken }).connect();
+  t.after(() => ext2.disconnect());
+
+  const status = await (await fetch(`${b2.base}/status`, { headers: { authorization: `Bearer ${key}` } })).json();
+  assert.equal(status.conversation, original, 'mapping restored before any chat');
+
+  const r2 = await fetch(`${b2.base}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'second' }] }),
+  });
+  assert.equal((await r2.json()).choices[0].message.content, 'ok');
+  assert.equal(ext2.created.length, 1, 'deleted conversation was replaced with a fresh one');
+  const replacement = ext2.created.at(-1).requestId.replace(/-/g, '').slice(0, 16);
+  assert.equal(ext2.chats.at(-1).conversationId, replacement, 'retry landed in the new conversation');
+
+  // Third life: replacement must now be the persisted mapping.
+  b2.stop();
+  const b3 = await startBridge(env);
+  t.after(() => b3.stop());
+  const status3 = await (await fetch(`${b3.base}/status`, { headers: { authorization: `Bearer ${key}` } })).json();
+  assert.equal(status3.conversation, replacement, 'replacement survives another restart');
+  const otherStatus = await (await fetch(`${b3.base}/status`, { headers: { authorization: `Bearer ${otherKey}` } })).json();
+  assert.equal(otherStatus.conversation, otherConversation, 'replacing one key leaves other mappings untouched');
 });
