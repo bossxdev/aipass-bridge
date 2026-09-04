@@ -101,12 +101,9 @@ function extractModels(decoded) {
 
 const jobs = new Map();
 const extClients = new Set();
-let rr = 0;
-
-const pickClient = () => {
-  const list = [...extClients];
-  return list.length ? list[rr++ % list.length] : null;
-};
+// Broadcast dispatch replaced round-robin pickClient/rr: zombie SSE connections
+// from evicted workers would otherwise steal every other job.
+let pollRr = 0;
 
 const sendToClient = (client, event, data) =>
   client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -135,15 +132,23 @@ class Job {
     clearTimeout(this.timer);
     this.timer = setTimeout(() => this.fail('timed out waiting for the extension'), this.timeoutMs);
   }
-  dispatch() {
-    const client = pickClient();
-    if (!client) return this.fail('no extension connected — open a de.aipass.net tab and check the popup');
-    this.client = client;
-    sendToClient(client, 'job', this.kind === 'loader'
+  payload() {
+    return this.kind === 'loader'
       ? { jobId: this.id, kind: 'loader', url: this.url }
       : this.kind === 'create'
       ? { jobId: this.id, kind: 'create', modelId: this.modelId, message: this.message, requestId: this.requestId, assistant: this.assistant, assistantField: this.assistantField }
-      : { jobId: this.id, kind: 'chat', conversationId: this.conversationId, modelId: this.modelId, text: this.text });
+      : { jobId: this.id, kind: 'chat', conversationId: this.conversationId, modelId: this.modelId, text: this.text };
+  }
+  dispatch() {
+    if (!extClients.size) return this.fail('no extension connected — open a de.aipass.net tab and check the popup');
+    // Broadcast, not round-robin: a zombie SSE from an evicted worker stays
+    // in extClients until the kernel closes it, and rr++ would hand every
+    // other job to that black hole. The extension dedupes via seenJobs, so
+    // multiple deliveries are safe.
+    for (const client of extClients) {
+      this.client = client;
+      sendToClient(client, 'job', this.payload());
+    }
   }
   delta(part) { if (!this.settled) { this.touch(); this.onDelta(part); } }
   done(value) { if (this.settled) return; this.cleanup(); this.onDone(value ?? 'stop'); }
@@ -156,7 +161,9 @@ class Job {
   cleanup() { this.settled = true; clearTimeout(this.timer); jobs.delete(this.id); }
 }
 
-const fetchLoader = (url, timeoutMs = 20_000) =>
+// A discarded tab must reload (15s load wait) before the page can run the
+// loader fetch; 20s died on that path every time. 45s covers reload+fetch.
+const fetchLoader = (url, timeoutMs = 45_000) =>
   new Promise((resolve, reject) => {
     const job = new Job({ kind: 'loader', url, timeoutMs, onDelta: () => {}, onDone: resolve, onError: (m) => reject(new Error(m)) });
     job.dispatch();
@@ -574,6 +581,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === '/ext/events' && req.method === 'GET') return extEvents(req, res);
+    if (path === '/ext/poll' && req.method === 'GET') {
+      // Pull fallback for MV3 workers suspended mid-SSE. Repeating a pending
+      // job is safe: the extension deduplicates successful dispatches, while a
+      // worker that dies before dispatch must not claim the job permanently.
+      const pending = [...jobs.values()];
+      const job = pending.length ? pending[pollRr++ % pending.length] : null;
+      return json(res, 200, { job: job?.payload() ?? null });
+    }
     if (path === '/ext/chunk' && req.method === 'POST') return await extPost(req, res, 'chunk');
     if (path === '/ext/done' && req.method === 'POST') return await extPost(req, res, 'done');
     if (path === '/ext/error' && req.method === 'POST') return await extPost(req, res, 'error');

@@ -20,7 +20,10 @@
       if (!/^\/loaders\/[A-Za-z0-9._~-]+(\.data)?(\?|$)/.test(job.url)) {
         throw new Error(`refusing non-loader path: ${job.url}`);
       }
-      const res = await fetch(job.url, { credentials: 'include', headers: { accept: '*/*' } });
+      // Unbounded fetch here meant a hung upstream loader looked identical to
+      // a lost result: no POST ever arrived and the job died on the bridge
+      // timeout. Bound it so a hang surfaces as a normal error reply.
+      const res = await fetch(job.url, { credentials: 'include', headers: { accept: '*/*' }, signal: AbortSignal.timeout(30_000) });
       if (!res.ok) throw new Error(`aipass returned ${res.status} ${res.statusText}`);
       reply({ jobId: job.jobId, kind: 'loader', raw: await res.text() });
     } catch (err) {
@@ -94,7 +97,7 @@
       });
 
       if (!res.ok) {
-        const detail = (await res.text().catch(() => '')).slice(0, 300);
+        await res.arrayBuffer().catch(() => {}); // drain, never surface the body
         // A bare HTML error means an edge proxy blocked us before the app saw
         // the request; these headers say which one.
         const forensics = ['server', 'via', 'cf-ray', 'retry-after']
@@ -104,7 +107,7 @@
           .join(' ');
         throw new Error(
           `aipass returned ${res.status} ${res.statusText} [${body.length} bytes]` +
-          `${forensics ? ` {${forensics}}` : ''}${detail ? ` — ${detail}` : ''}`
+          `${forensics ? ` {${forensics}}` : ''}`
         );
       }
 

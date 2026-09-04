@@ -7,6 +7,7 @@ const current = () => window.__aipassBridgeContentGen === GEN;
 
 const TAG = '__aipass_bridge';
 let pageReady = false;
+const pageReadyWaiters = new Set();
 let workerPort = null;
 let kaGen = 0;
 
@@ -34,7 +35,12 @@ window.addEventListener('message', (event) => {
   const msg = event.data;
   if (!msg || typeof msg !== 'object' || msg[TAG] !== 'res') return;
   const { [TAG]: _, ...payload } = msg;
-  if (payload.kind === 'page-ready') pageReady = true;
+  if (payload.kind === 'page-ready') {
+    pageReady = true;
+    for (const waiter of pageReadyWaiters) waiter();
+    pageReadyWaiters.clear();
+    return;
+  }
   toWorker(payload);
 });
 
@@ -43,8 +49,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'run') window.postMessage({ [TAG]: 'req', job: msg.job }, window.location.origin);
   else if (msg?.type === 'abort') window.postMessage({ [TAG]: 'abort', jobId: msg.jobId }, window.location.origin);
   else if (msg?.type === 'ping') {
+    // page.js answers asynchronously; replying with the cached flag raced (the
+    // page-ready reply arrived after sendResponse had already reported a stale
+    // false, so the background re-injected forever and never dispatched).
     window.postMessage({ [TAG]: 'ping' }, window.location.origin);
-    sendResponse({ ok: pageReady });
+    if (pageReady) { sendResponse({ ok: true }); return true; }
+    const timer = setTimeout(() => { pageReadyWaiters.delete(ready); sendResponse({ ok: false }); }, 2000);
+    const ready = () => { clearTimeout(timer); sendResponse({ ok: true }); };
+    pageReadyWaiters.add(ready);
     return true;
   }
 });
@@ -64,7 +76,7 @@ function keepAlive() {
 
   const beat = setInterval(() => {
     try { port.postMessage({ t: Date.now() }); } catch { /* disconnect handles it */ }
-  }, 20_000);
+  }, 5_000);
   // Own-side disconnect does not fire own onDisconnect — reschedule here or
   // the port goes permanently dead and every page result is dropped.
   const cycle = setTimeout(() => {

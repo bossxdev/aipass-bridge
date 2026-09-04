@@ -13,6 +13,7 @@ let controller = null;
 let connected = false;
 let lastError = '';
 const jobTabs = new Map();
+const seenJobs = new Set();
 
 const bridgeUrl = async () =>
   ((await chrome.storage.local.get('bridgeUrl')).bridgeUrl || DEFAULT_BRIDGE).trim();
@@ -97,24 +98,30 @@ async function ensureContentScript(tab) {
 }
 
 async function handleJob(job) {
-  const tab = (await findChatTab())
-    // After a reboot the watchdog may not have opened the tab yet; create it
-    // instead of failing the job. Focused window keeps Chrome in the background.
-    ?? (await chrome.tabs.create({ url: 'https://de.aipass.net/chat', active: false }));
+  if (seenJobs.has(job.jobId)) return;
+  seenJobs.add(job.jobId);
+  const tab = await findChatTab();
   if (!tab) {
     await post('/ext/error', { jobId: job.jobId, message: 'could not open a de.aipass.net tab' });
     return;
   }
   jobTabs.set(job.jobId, tab.id);
   try {
-    if (tab.status !== 'complete') await waitForComplete(tab.id).catch(() => {});
+    // A discarded restored tab never fires onUpdated until reloaded, so a load
+    // wait on it burns the full 15s for nothing — reload first instead.
+    if (tab.discarded || tab.status === 'unloaded') {
+      await chrome.tabs.reload(tab.id).catch(() => {});
+      await waitForComplete(tab.id).catch(() => {});
+    } else if (tab.status !== 'complete') {
+      await waitForComplete(tab.id).catch(() => {});
+    }
     await ensureContentScript(tab);
     await chrome.tabs.sendMessage(tab.id, { type: 'run', job });
   } catch (err) {
     jobTabs.delete(job.jobId);
     await post('/ext/error', {
       jobId: job.jobId,
-      message: `could not reach the de.aipass.net tab (${tab.url ?? tab.id}): ${err?.message ?? err}`,
+      message: `could not reach the de.aipass.net tab (tab ${tab.id}): ${err?.message ?? err}`,
     });
   }
 }
@@ -143,6 +150,11 @@ async function connect() {
 
     connected = true;
     lastError = '';
+    // Bridge fires model refresh 500ms after connect; worker without a
+    // keepalive port can be suspended before the SSE reader processes the
+    // frame. Deferred polls claim the job via /ext/poll instead.
+    setTimeout(pollOnce, 600);
+    setTimeout(pollOnce, 2000);
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let pending = '';
@@ -164,7 +176,10 @@ async function connect() {
           else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
         }
         if (!dataLines.length) continue; // comment / keepalive
-        try { handleEvent(name, JSON.parse(dataLines.join('\n'))); } catch { /* ignore */ }
+        try {
+          const data = JSON.parse(dataLines.join('\n'));
+          if (name !== 'ready') handleEvent(name, data);
+        } catch { /* ignore */ }
       }
     }
   } catch (err) {
@@ -187,14 +202,33 @@ function handlePageMessage(msg) {
   return true;
 }
 
+async function pollOnce() {
+  try {
+    const r = await fetch(`${await bridgeUrl()}/ext/poll`, {
+      headers: { authorization: `Bearer ${await bridgeToken()}` },
+    });
+    if (!r.ok) return;
+    const { job } = await r.json();
+    if (job) handleJob(job);
+  } catch { /* ignore */ }
+}
+
 // A content script holds this port open so Chrome does not evict the worker.
 // Use that same port for page results: one-way runtime.sendMessage can resolve
 // without a receiver after worker eviction, silently losing terminal replies.
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'keepalive') return;
-  connect(); // a de.aipass.net tab just appeared (or the worker just woke)
+  // Startup can leave an SSE request registered server-side after Chrome has
+  // stopped scheduling its reader. A live content port proves this worker can
+  // process events, so replace any pre-port connection instead of reusing it.
+  if (controller) controller.abort();
+  else connect();
+  // Poll for queued jobs once per second while this content port is alive.
+  // This is the fallback path: if the SSE reader was suspended by Chrome the
+  // job will be claimed here instead of being dropped silently.
+  const pollTimer = setInterval(pollOnce, 1000);
   port.onMessage.addListener(handlePageMessage);
-  port.onDisconnect.addListener(() => { void chrome.runtime.lastError; });
+  port.onDisconnect.addListener(() => { clearInterval(pollTimer); void chrome.runtime.lastError; });
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -215,12 +249,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'reconnect') { controller?.abort(); connect(); sendResponse({ ok: true }); return true; }
 });
 
+// Reload any discarded aipass.net tabs so the content script reconnects its
+// keepalive port. Without that port Chrome can suspend this worker while the
+// SSE socket stays alive at the kernel level, silently swallowing job events.
+// No tab-creation here: users found the auto-spawned minimized windows
+// disruptive; jobs fail with a clear error instead when no tab is open.
+async function ensureTabsActive() {
+  const tabs = await chrome.tabs.query({ url: 'https://de.aipass.net/*' }).catch(() => []);
+  for (const tab of tabs) await ensureContentScript(tab).catch(() => {});
+}
+
 // The worker can be evicted at any time; the alarm brings it back and the
 // connect() guard makes a duplicate call harmless.
 chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener(() => connect());
-chrome.runtime.onStartup.addListener(() => connect());
-chrome.runtime.onInstalled.addListener(() => connect());
+chrome.alarms.onAlarm.addListener(async () => { await pollOnce(); connect(); ensureTabsActive(); });
+chrome.runtime.onStartup.addListener(async () => { await pollOnce(); connect(); ensureTabsActive(); });
+chrome.runtime.onInstalled.addListener(async () => { await pollOnce(); connect(); });
 
 // Node tests opt out of the long-lived SSE connection and exercise these two
 // boundary helpers directly.
@@ -233,4 +277,5 @@ if (globalThis.__AIPASS_BRIDGE_TEST__) {
   };
 } else {
   connect();
+  ensureTabsActive();
 }

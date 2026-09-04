@@ -8,9 +8,19 @@ const source = await readFile(new URL('../extension/background.js', import.meta.
 function load({ fetch, sendMessage = async () => ({ ok: true }), query = async () => [], create } = {}) {
   const noopEvent = { addListener() {}, removeListener() {} };
   const chrome = {
-    storage: { local: { get: async (key) => key === 'bridgeUrl'
-      ? { bridgeUrl: 'http://127.0.0.1:8788' }
-      : { token: 'secret-test-token' } } },
+    storage: { local: {
+      get: async (key) => key === 'bridgeUrl'
+        ? { bridgeUrl: 'http://127.0.0.1:8788' }
+        : { token: 'secret-test-token' },
+      set: async () => {},
+    } },
+    windows: {
+      create: async (props) => {
+        const tab = { id: 42, status: 'complete', discarded: false, url: props?.url, windowId: 7 };
+        create?.({ url: props?.url }); // record like tabs.create did
+        return { tabs: [tab] };
+      },
+    },
     tabs: {
       sendMessage,
       query,
@@ -74,28 +84,61 @@ test('final POST failure exposes path and status only', async () => {
   assert.doesNotMatch(api.status().lastError, /secret|sensitive|token/i);
 });
 
-test('job with no chat tab creates one and dispatches into it', async () => {
+test('job with no chat tab fails without creating one', async () => {
   const created = [];
-  const dispatched = [];
+  const errors = [];
   const { api } = load({
-    fetch: async () => new Response(null, { status: 204 }),
+    fetch: async (url, opts) => {
+      const body = JSON.parse(opts?.body ?? '{}');
+      if (String(url).endsWith('/ext/error')) errors.push(body);
+      return new Response(null, { status: 204 });
+    },
     query: async () => [],
-    create: async (props) => {
-      const tab = { id: 42, status: 'complete', discarded: false, url: props.url, ...props };
-      created.push(tab.url);
-      return tab;
-    },
-    sendMessage: async (tabId, msg) => {
-      if (msg?.type === 'ping') return { ok: true };
-      dispatched.push({ tabId, type: msg?.type });
-      return { ok: true };
-    },
+    create: async (props) => { created.push(props); return { id: 42, status: 'complete', discarded: false }; },
   });
 
   await api.handleJob({ jobId: 'job-2' });
 
-  assert.equal(created.length, 1);
-  assert.equal(created[0], 'https://de.aipass.net/chat');
-  assert.equal(dispatched.at(-1).tabId, 42);
-  assert.equal(dispatched.at(-1).type, 'run');
+  assert.equal(created.length, 0);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /could not open a de\.aipass\.net tab/);
+});
+
+test('duplicate poll delivery dispatches a job only once', async () => {
+  let runs = 0;
+  const { api } = load({
+    fetch: async () => new Response(null, { status: 204 }),
+    query: async () => [{ id: 7, status: 'complete', discarded: false, url: 'https://de.aipass.net/chat' }],
+    sendMessage: async (_tabId, msg) => {
+      if (msg?.type === 'run') runs += 1;
+      return { ok: true };
+    },
+  });
+
+  await api.handleJob({ jobId: 'job-3' });
+  await api.handleJob({ jobId: 'job-3' });
+  assert.equal(runs, 1);
+});
+
+test('failed dispatch reports error once, does not redispatch in same worker', async () => {
+  let attempts = 0;
+  const errors = [];
+  const { api } = load({
+    fetch: async (url, opts) => {
+      const body = JSON.parse(opts?.body ?? '{}');
+      if (String(url).endsWith('/ext/error')) errors.push(body);
+      return new Response(null, { status: 204 });
+    },
+    query: async () => [{ id: 7, status: 'complete', discarded: false, url: 'https://de.aipass.net/chat' }],
+    sendMessage: async (_tabId, msg) => {
+      if (msg?.type === 'ping') return { ok: true };
+      attempts += 1;
+      throw new Error('worker lost');
+    },
+  });
+
+  await api.handleJob({ jobId: 'job-4' });
+  await api.handleJob({ jobId: 'job-4' });
+  assert.equal(attempts, 1);
+  assert.equal(errors.length, 1);
 });
